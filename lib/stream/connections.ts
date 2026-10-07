@@ -541,10 +541,10 @@ function pushTranscriptDeltaFrom(
       fresh.push(it);
     }
   }
-  if (!fresh.length) {
-    sub.cursor = maxId; // nothing to deliver — just move past the reads
-    return;
-  }
+  // Even filtered/system-only commits carry a completion cursor. Otherwise
+  // clients cannot distinguish missing anchor rows from rows still in flight.
+  // Let deliver advance the cursor only after the stream accepted this frame.
+  if (maxId <= sub.cursor) return;
   attachToolState(db, id, fresh);
   // `type: "items"` is what components/TranscriptView.tsx dispatches on
   deliver(c, { kind: "transcript", id, type: "items", items: fresh, lastId: maxId });

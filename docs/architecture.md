@@ -36,6 +36,8 @@ Metadata comes from `reduceEvent`; new keys must be added to `META_KEYS`, and re
 
 The separate transcript subscription provides durable commits and older pagination. Those replies extend durable rows only within the current watermark; they cannot replace authoritative retained state. Results from an old session, epoch, or replaced snapshot are discarded.
 
+View patches and transcript deltas can arrive separately at a turn boundary. The browser tracks the transcript's acknowledged raw `lastId` independently of the view's `durableThrough`. It keeps the last coherent rendered regions until the new watermark has been delivered, and holds early rows above the watermark for the corresponding view patch. Filtered-only commits still send an empty delta with their completion cursor. A stalled delivery requests a fresh view snapshot after two seconds; this deadline triggers recovery, rather than suppressing integrity alarms. Once delivery completes, anchors beyond the delivered durable tail still report `orphanAnchor`. An empty, untruncated snapshot also proves missing anchors; an empty truncated tail does not, because its anchors may belong to older history.
+
 ## Regions, identity, and finalization
 
 The displayed conversation consists of four inputs:
