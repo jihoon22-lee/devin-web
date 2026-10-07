@@ -53,7 +53,7 @@ bin/devin-web-ctl restart
 
 `pnpm verify` is safe while the production server runs and requires Git for its Git fixtures. `pnpm build` rewrites `.next`; promptly restart the web after a successful build. Use an idle maintenance window to minimize asset mismatches during the build. Tests and builds do not prove that the deployed CLI is authenticated or compatible; check the UI health dialog and a normal session after restart.
 
-For a source archive installation, obtain the new source archive from the repository, keep runtime state outside the source directory, and install/build in the new directory. Contributor verification needs Git. Stop the old web supervisor before changing the installation path, then start the new controller with the same environment. Preserve the daemon only if the release is compatible with it; schedule any required daemon update while idle. Never run the old and new watchdogs concurrently against the same state directory.
+For a source archive installation, obtain the new source archive from the repository, keep runtime state outside the source directory, and install/build in the new directory. Contributor verification needs Git. Process ownership is bound to the installation path: moving directories requires an all-idle maintenance window even when the daemon protocol is compatible. Finish terminal work, use the controller in the old directory to stop the supervisor, web and daemon (`stop --all`), then start the new controller with the same exported settings and state directory. This path change ends daemon-owned terminals. Never run the old and new watchdogs concurrently against the same state directory.
 
 Web-only updates leave the daemon executing its previous loaded code. If an update changes the daemon or the web/daemon protocol, read the change notes and schedule its idle restart before treating the update as complete. Retain a known-good source revision and the corresponding lockfile for rollback.
 
@@ -70,6 +70,7 @@ Start with the UI diagnostics dialog, `bin/devin-web-ctl status`, and `GET /api/
 | Daemon down, degraded, or orphaned agent detected | Read `acpd.log` and `acpd-status.json`; preserve running work, identify ownership, then recover during an idle window |
 | CLI schema drift/unavailable | Check the reported CLI version and required columns; do not modify the CLI database schema to suppress the warning |
 | Empty/stale transcript or reconnect failures | Inspect `[stream]`, `[diag]`, and `[integrity]`, then capture a sanitized reproduction; do not reload a live daemon session through ACP merely to seed the UI |
+| Prompt stays queued while the previous transcript is not ready | Automatic retries continue without an open browser. Check storage availability and finalization errors. Retrieve or edit the queued prompt, or continue in a new session if recovery is delayed. Do not delete `itemlog.db` or force a new turn over the preserved previous region |
 | Web remains stopped after an intentional stop | Run `ctl start` to re-arm supervision; `web.disabled` is intentional |
 | Search cache is large or inconsistent | Run `bin/devin-web-ctl search-compact` during low activity; it rebuilds/vacuums the web search cache |
 
