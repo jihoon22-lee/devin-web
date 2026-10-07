@@ -1,13 +1,17 @@
 import { CSRF_HEADER } from "@/lib/security/requestGuard";
 import type { ContentBlock } from "@/lib/acp/types";
 
+export class ApiError extends Error {
+  constructor(message: string, readonly body: unknown) { super(message); }
+}
+
 export async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
     headers: { "Content-Type": "application/json", [CSRF_HEADER]: "1", ...(init?.headers ?? {}) },
   });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error((body as { error?: string }).error || res.statusText);
+  if (!res.ok) throw new ApiError((body as { error?: string }).error || res.statusText, body);
   return body as T;
 }
 

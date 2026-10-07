@@ -294,6 +294,12 @@ function SessionChanges({ sessionId, onOpenChat }: { sessionId: string; onOpenCh
       }
       load();
     } catch (e) {
+      const body = e instanceof Error && "body" in e ? e.body : null;
+      if (action === "revert" && file && body && typeof body === "object" &&
+          "undoId" in body && typeof body.undoId === "string") {
+        setUndo({ id: body.undoId, file });
+      }
+      load(); // git may have changed part of the worktree before failing
       toast(`${action} failed: ${(e as Error).message}`);
     } finally {
       setBusy(null);

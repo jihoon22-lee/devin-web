@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { manager } from "@/lib/state";
-import { changedFiles, changePaths, commitStaged, currentBranch, filePatch, gitRoot, isSafeRelPath, revertFile, stageFile, unstageFile } from "@/lib/gitChanges";
-import { backupBeforeRevert, undoRevert } from "@/lib/revertTrash";
+import { changedFiles, prepareRevert, RevertConflictError, commitStaged, currentBranch, filePatch, gitRoot, isSafeRelPath, revertFile, stageFile, unstageFile } from "@/lib/gitChanges";
+import { assertBackupUnchanged, backupBeforeRevert, undoRevert } from "@/lib/revertTrash";
 
 export const dynamic = "force-dynamic";
 
@@ -76,9 +76,17 @@ export async function POST(req: Request, ctx: Ctx) {
       case "revert": {
         if (!file) return NextResponse.json({ error: "file required" }, { status: 400 });
         // copy the worktree bytes aside first — Revert is otherwise final
-        const root = await gitRoot(cwd);
-        const undoId = backupBeforeRevert(root, file, await changePaths(root, file));
-        await revertFile(root, file);
+        const plan = await prepareRevert(cwd, file);
+        const undoId = backupBeforeRevert(plan.root, file, plan.paths);
+        try {
+          await revertFile(plan.root, file, plan, () => assertBackupUnchanged(undoId, plan.root));
+        } catch (e) {
+          // Conflicts did not discard anything. Other git errors may leave a
+          // partial checkout; expose its safety copy even on an HTTP error.
+          return NextResponse.json({ error: (e as Error).message,
+            ...(e instanceof RevertConflictError ? { backupId: undoId } : { undoId }),
+          }, { status: e instanceof RevertConflictError ? 409 : 500 });
+        }
         return NextResponse.json({ ok: true, undoId });
       }
       case "undo": {

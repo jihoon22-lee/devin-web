@@ -4,6 +4,7 @@
  *  restored. $STATE_DIR/revert-trash, at most 50 entries / 24h. */
 import { randomBytes } from "node:crypto";
 import { chmodSync, copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { RevertConflictError } from "./gitChanges";
 import { stateDir } from "./paths.mjs";
 import { dirname, join, resolve, sep } from "node:path";
 
@@ -49,22 +50,42 @@ function safeDestination(cwd: string, file: string): string {
   return dst;
 }
 
+function saveFiles(cwd: string, paths: string[], dir: string): SavedFile[] {
+  return paths.map((file, i) => {
+    const src = safeDestination(cwd, file);
+    const st = statOrMissing(src);
+    if (!st) return { file, kind: "absent" };
+    if (st.isSymbolicLink()) return { file, kind: "symlink", target: readlinkSync(src) };
+    if (!st.isFile()) throw new Error("only files and symlinks can be reverted");
+    const content = `content-${i}`;
+    copyFileSync(src, join(dir, content));
+    chmodSync(join(dir, content), 0o600);
+    return { file, kind: "file", content, mode: st.mode & 0o777 };
+  });
+}
+
+/** Same-path writes are not visible in porcelain status; compare the actual
+ * bytes, type and permissions saved by this request before discarding them. */
+export function assertBackupUnchanged(id: string, cwd: string): void {
+  const dir = join(trashDir(), id);
+  const meta = JSON.parse(readFileSync(join(dir, "meta.json"), "utf8")) as TrashMeta;
+  if (resolve(meta.cwd) !== resolve(cwd) || !meta.files) throw new Error("invalid backup");
+  for (const entry of meta.files) {
+    const src = safeDestination(cwd, entry.file);
+    const st = statOrMissing(src);
+    const unchanged = entry.kind === "absent" ? !st
+      : entry.kind === "symlink" ? st?.isSymbolicLink() && readlinkSync(src) === entry.target
+      : st?.isFile() && (st.mode & 0o777) === entry.mode && readFileSync(src).equals(readFileSync(join(dir, entry.content)));
+    if (!unchanged) throw new RevertConflictError("Worktree changed since the safety copy; refresh and try again. Nothing was discarded.");
+  }
+}
+
 export function backupBeforeRevert(cwd: string, file: string, relatedFiles: string[] = []): string {
   const id = `${Date.now()}-${randomBytes(6).toString("hex")}`;
   const dir = join(trashDir(), id);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   try {
-    const files: SavedFile[] = [...new Set([file, ...relatedFiles])].map((path, i) => {
-      const src = safeDestination(cwd, path);
-      const st = statOrMissing(src);
-      if (!st) return { file: path, kind: "absent" };
-      if (st.isSymbolicLink()) return { file: path, kind: "symlink", target: readlinkSync(src) };
-      if (!st.isFile()) throw new Error("only files and symlinks can be reverted");
-      const content = `content-${i}`;
-      copyFileSync(src, join(dir, content));
-      chmodSync(join(dir, content), 0o600);
-      return { file: path, kind: "file", content, mode: st.mode & 0o777 };
-    });
+    const files = saveFiles(cwd, [...new Set([file, ...relatedFiles])], dir);
     const meta: TrashMeta = { cwd, file, at: Date.now(), existed: files[0].kind !== "absent", version: 2, files };
     writeFileSync(join(dir, "meta.json"), JSON.stringify(meta), { mode: 0o600 });
   } catch (e) {
@@ -85,28 +106,53 @@ export function undoRevert(id: string, cwd: string): TrashMeta {
     meta.existed ? { file: meta.file, kind: "file", content: "content", mode: 0o600 } : { file: meta.file, kind: "absent" },
   ];
   const staged: { dst: string; tmp: string | null }[] = [];
-  try {
-    // Prepare every replacement before changing any destination. Leave the
-    // backup intact if preparation or a later rename fails, allowing retry.
-    for (const entry of files) {
-      const dst = safeDestination(cwd, entry.file);
-      const st = statOrMissing(dst);
-      if (st && !st.isFile() && !st.isSymbolicLink()) throw new Error("recovery destination is not a file");
-      if (meta.version !== 2 && st?.isSymbolicLink()) throw new Error("legacy backup cannot safely restore a symlink");
-      if (entry.kind === "absent") { staged.push({ dst, tmp: null }); continue; }
-      mkdirSync(dirname(dst), { recursive: true });
-      const tmp = join(dirname(dst), `.devin-undo-${randomBytes(12).toString("hex")}`);
-      staged.push({ dst, tmp });
+  const changed: number[] = [];
+  // Keep the pre-undo state separately from the original safety copy. If a
+  // compensating write also fails, this manifest identifies every saved path.
+  const recoveryDir = join(dir, `before-undo-${randomBytes(6).toString("hex")}`);
+  mkdirSync(recoveryDir, { mode: 0o700 });
+  let prior: SavedFile[] = [];
+  const prepare = (entry: SavedFile, contentDir: string, legacy = false) => {
+    const dst = safeDestination(cwd, entry.file);
+    const st = statOrMissing(dst);
+    if (st && !st.isFile() && !st.isSymbolicLink()) throw new Error("recovery destination is not a file");
+    if (legacy && st?.isSymbolicLink()) throw new Error("legacy backup cannot safely restore a symlink");
+    if (entry.kind === "absent") return { dst, tmp: null };
+    mkdirSync(dirname(dst), { recursive: true });
+    const tmp = join(dirname(dst), `.devin-undo-${randomBytes(12).toString("hex")}`);
+    try {
       if (entry.kind === "symlink") symlinkSync(entry.target, tmp);
       else if (entry.kind === "file" && /^(content|content-\d+)$/.test(entry.content)) {
-        copyFileSync(join(dir, entry.content), tmp);
-        chmodSync(tmp, meta.version === 2 ? entry.mode & 0o777 : (st?.mode ?? 0o600) & 0o777);
+        copyFileSync(join(contentDir, entry.content), tmp);
+        chmodSync(tmp, legacy ? (st?.mode ?? 0o600) & 0o777 : entry.mode & 0o777);
       } else throw new Error("invalid recovery metadata");
+      return { dst, tmp };
+    } catch (e) { rmSync(tmp, { force: true }); throw e; }
+  };
+  const apply = (entry: { dst: string; tmp: string | null }) => {
+    if (entry.tmp) renameSync(entry.tmp, entry.dst);
+    else rmSync(entry.dst, { force: true });
+  };
+  try {
+    prior = saveFiles(cwd, files.map((entry) => entry.file), recoveryDir);
+    writeFileSync(join(recoveryDir, "meta.json"), JSON.stringify({ cwd, file: meta.file, version: 2, files: prior }), { mode: 0o600 });
+    for (const entry of files) staged.push(prepare(entry, dir, meta.version !== 2));
+    for (let i = 0; i < staged.length; i++) {
+      apply(staged[i]);
+      changed.push(i);
     }
-    for (const entry of staged) {
-      if (entry.tmp) renameSync(entry.tmp, entry.dst);
-      else rmSync(entry.dst, { force: true });
+  } catch (e) {
+    const failures: string[] = [];
+    for (const i of changed.reverse()) {
+      let rollback: ReturnType<typeof prepare> | undefined;
+      try { rollback = prepare(prior[i], recoveryDir); apply(rollback); }
+      catch (restoreError) { failures.push(`${prior[i].file}: ${(restoreError as Error).message}`); }
+      finally { if (rollback?.tmp) rmSync(rollback.tmp, { force: true }); }
     }
+    if (failures.length) {
+      throw new Error(`${(e as Error).message}; rollback also failed (${failures.join("; ")}). Pre-undo recovery retained at ${recoveryDir}; original backup retained at ${dir}`);
+    }
+    throw e; // original safety copy and pre-undo recovery remain for retry
   } finally {
     for (const entry of staged) if (entry.tmp) rmSync(entry.tmp, { force: true });
   }

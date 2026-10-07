@@ -140,11 +140,9 @@ export async function unstageFile(cwd: string, file: string) {
   return git(cwd, ["restore", "--staged", "--", ...await changePaths(cwd, file)]);
 }
 
-/** Query the whole status: restricting to the new path hides the rename source. */
-export async function changePaths(cwd: string, file: string): Promise<string[]> {
+function pathsFromStatus(status: string, file: string): string[] {
   if (!isSafeRelPath(file)) throw new Error("invalid path");
-  const files = parsePorcelainZ(await git(cwd, ["status", "--porcelain=v1", "-z", "-uall"]));
-  const entry = files.find((f) => f.path === file);
+  const entry = parsePorcelainZ(status).find((f) => f.path === file);
   if (entry?.originalPath) {
     if (!isSafeRelPath(entry.originalPath)) throw new Error("invalid rename source");
     return [entry.originalPath, file];
@@ -152,13 +150,45 @@ export async function changePaths(cwd: string, file: string): Promise<string[]> 
   return [file];
 }
 
-/** Discard a file's changes — `git clean -f` for untracked files (no HEAD
- *  version to restore to), `git restore` for tracked ones. */
-export async function revertFile(cwd: string, file: string) {
-  cwd = await gitRoot(cwd);
-  const st = await git(cwd, ["status", "--porcelain=v1", "-z", "--", file]);
-  if (st.startsWith("??")) return git(cwd, ["clean", "-f", "--", file]);
-  return git(cwd, ["restore", "--worktree", "--staged", "--", ...await changePaths(cwd, file)]);
+/** Query the whole status: restricting to the new path hides the rename source. */
+export async function changePaths(cwd: string, file: string): Promise<string[]> {
+  return pathsFromStatus(await git(cwd, ["status", "--porcelain=v1", "-z", "-uall"]), file);
+}
+
+export class RevertConflictError extends Error {}
+export interface RevertPlan {
+  root: string;
+  file: string;
+  paths: string[];
+  status: string;
+  index: string;
+  untracked: boolean;
+}
+
+export async function prepareRevert(cwd: string, file: string): Promise<RevertPlan> {
+  const root = await gitRoot(cwd);
+  const status = await git(root, ["status", "--porcelain=v1", "-z", "-uall"]);
+  const paths = pathsFromStatus(status, file);
+  const index = await git(root, ["ls-files", "--stage", "-z", "--", ...paths]);
+  return { root, file, paths, status, index, untracked: parsePorcelainZ(status).find((f) => f.path === file)?.status === "??" };
+}
+
+/** Discard only the paths captured before the safety copy. Validate status,
+ * index and (via beforeDiscard) saved worktree bytes immediately before git. */
+export async function revertFile(cwd: string, file: string, prepared?: RevertPlan, beforeDiscard?: () => void) {
+  const plan = prepared ?? await prepareRevert(cwd, file);
+  if (plan.file !== file) throw new RevertConflictError("discard target changed");
+  const [status, index] = await Promise.all([
+    git(plan.root, ["status", "--porcelain=v1", "-z", "-uall"]),
+    git(plan.root, ["ls-files", "--stage", "-z", "--", ...plan.paths]),
+  ]);
+  if (status !== plan.status || index !== plan.index) {
+    throw new RevertConflictError("Changes changed since the safety copy; refresh and try again. Nothing was discarded.");
+  }
+  beforeDiscard?.();
+  return plan.untracked
+    ? git(plan.root, ["clean", "-f", "--", ...plan.paths])
+    : git(plan.root, ["restore", "--worktree", "--staged", "--", ...plan.paths]);
 }
 
 /** Commits run hooks (lint-staged, tests) and may wait on GPG signing — the
