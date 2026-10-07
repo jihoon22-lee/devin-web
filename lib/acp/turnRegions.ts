@@ -233,6 +233,25 @@ export class TurnRegions {
   }
 
   beginTurn(sessionId: string) {
+    this.ensureProvisional(sessionId);
+    const previous = this.prov.get(sessionId);
+    if (previous?.ended) {
+      // ACP completion does not acknowledge the independent SQLite commit.
+      // Retry even without a failed write: a new turn sharing this start node
+      // would erase the old ephemera and align new content to the old rows.
+      this.onDurableChange();
+      if (this.prov.get(sessionId) === previous && previous.asm.list().some(item =>
+        item.kind === "plan" || item.kind === "tool" ||
+        (item.kind === "text" && (item.role === "agent" || item.role === "thought")),
+      )) {
+        // Preserve the latest closed state before the coalesced flush, too.
+        // Error/cancel is not proof that no later durable write can arrive.
+        this.deps.storage.save(sessionId, previous.turnId, previous.turnStartNode, previous.asm.list(), true);
+        return undefined;
+      }
+      // Empty and user-echo-only failures may never produce durable rows.
+      // They have no agent content to recover and must not block the queue.
+    }
     this.failedFinalizations.delete(sessionId);
     // runId makes the turn id unique across web restarts — itemlog rows are
     // keyed (session_id, item_id) and item ids embed the turn id, so a
@@ -312,6 +331,7 @@ export class TurnRegions {
         if (typeof kind !== "string" || !CONTENT_UPDATES.has(kind)) return;
       } else if (ev.type !== "client_request") return;
       ps = this.beginTurn(sid);
+      if (!ps) return;
     }
     if (
       ev.type === "turn_end" ||

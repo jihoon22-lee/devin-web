@@ -56,6 +56,47 @@ const thought = (seqTo = 50): AssembledItem => ({
 afterEach(() => vi.useRealTimers());
 
 describe("TurnRegions with injected storage and durable state", () => {
+  it.each([false, true])("preserves a failed finalization at the next turn boundary (storage recovered: %s)", (recovered) => {
+    vi.useFakeTimers();
+    const { r, deps, feed, tip } = harness();
+    deps.storage = { restore: itemLog.itemLogRestore, loadRetained: itemLog.itemLogLoadRetained,
+      save: itemLog.itemLogSave, clearExcept: itemLog.itemLogClearExcept, drop: itemLog.itemLogDrop,
+      finalize: itemLog.itemLogFinalize, pruneRetained: itemLog.itemLogPruneRetained, forget: itemLog.itemLogForget };
+    itemLog.itemLogForget("s");
+    r.beginTurn("s");
+    feed("session_update", { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "keep at next turn" } });
+    vi.advanceTimersByTime(40);
+    const db = openDb(join(fixtureStateDir, "itemlog.db"));
+    try {
+      db.exec(`CREATE TRIGGER fail_next_turn BEFORE INSERT ON items WHEN NEW.done = 1
+        BEGIN SELECT RAISE(ABORT, 'temporary write failure'); END`);
+      tip(110); feed("turn_end", {});
+      if (recovered) db.exec("DROP TRIGGER fail_next_turn");
+      const next = r.beginTurn("s");
+      if (recovered) {
+        expect(next).toBeDefined();
+        expect(r.retained("s")).toMatchObject([{ text: "keep at next turn", done: true }]);
+      } else {
+        expect(next).toBeUndefined();
+        expect(r.provisional("s")).toMatchObject([{ text: "keep at next turn", done: true }]);
+      }
+      itemLog.itemLogResetForTests();
+      if (recovered) expect(itemLog.itemLogLoadRetained("s")).toMatchObject([{ text: "keep at next turn" }]);
+      else expect(itemLog.itemLogRestore("s")?.items).toMatchObject([{ text: "keep at next turn" }]);
+    } finally { db.exec("DROP TRIGGER IF EXISTS fail_next_turn"); db.close(); itemLog.itemLogForget("s"); }
+  });
+
+  it("retries a transient alignment failure before replacing the ended turn", () => {
+    const { r, deps, feed, tip } = harness();
+    const rows = deps.spineRows;
+    deps.spineRows = vi.fn().mockImplementationOnce(() => { throw new Error("temporary read error"); }).mockImplementation(rows);
+    r.beginTurn("s");
+    feed("session_update", { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "keep alignment" } });
+    tip(110); feed("turn_end", {});
+    expect(r.beginTurn("s")).toBeDefined();
+    expect(r.retained("s")).toMatchObject([{ text: "keep alignment", done: true }]);
+  });
+
   it.each([false, true])("persists the final unflushed region across SQLite reopen (prior flush: %s)", (flush) => {
     vi.useFakeTimers();
     const { r, deps, feed, tip } = harness();

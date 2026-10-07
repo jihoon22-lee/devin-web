@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 const stateDir = mkdtempSync(join(tmpdir(), "dw-runprompt-"));
 process.env.DEVIN_WEB_STATE_DIR = stateDir;
@@ -9,6 +9,7 @@ afterAll(() => rmSync(stateDir, { recursive: true, force: true }));
 
 import { SessionManager } from "../lib/acp/manager";
 import { METHODS } from "../lib/acp/types";
+import { readAllQueues } from "../lib/promptQueue";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -30,7 +31,8 @@ const notices = (m: SessionManager, id: string) =>
   (m as any).view.meta(id).items?.filter((i: any) => i.kind === "notice") ?? [];
 
 describe("runPrompt start-block failure (crash safety)", () => {
-  it("a throw before the prompt RPC still ends the turn and drains the queue", async () => {
+  it("contains a start failure and autonomously retries all prompts in FIFO order", async () => {
+    vi.useFakeTimers();
     const m = stubbed();
     loaded(m, "s1");
     const rejections: unknown[] = [];
@@ -59,8 +61,8 @@ describe("runPrompt start-block failure (crash safety)", () => {
       if (fail) { fail = false; throw new Error("boom"); }
       return beginTurn(sid);
     };
-    // the failed turn must still surface a turn_error — spy on emit because
-    // the next drained turn legitimately retires the notice from items
+    // No new turn exists yet: do not emit turn_error into the previous
+    // region. Report the start failure as a notice while preserving input.
     const errors: string[] = [];
     const origEmit = (m as any).emit.bind(m);
     (m as any).emit = (sid: string, type: string, data: any) => {
@@ -68,20 +70,29 @@ describe("runPrompt start-block failure (crash safety)", () => {
       return origEmit(sid, type, data);
     };
     try {
-      await m.prompt("s1", [{ type: "text", text: "X" }]);
-      await new Promise((r) => setTimeout(r, 10));
+      await expect(m.prompt("s1", [{ type: "text", text: "X" }])).resolves.toEqual({ queued: true });
+      expect(sent).toEqual([]);
+      expect(s.queue.map((q: any) => q.blocks[0].text)).toEqual(["A", "B", "X"]);
+      expect(readAllQueues().s1.map((q) => q.blocks[0])).toEqual([
+        { type: "text", text: "A" }, { type: "text", text: "B" }, { type: "text", text: "X" },
+      ]);
+      expect(notices(m, "s1").some((n: any) => n.text.includes("boom"))).toBe(true);
+      await vi.advanceTimersByTimeAsync(2000);
 
-      expect(sent).toEqual(["A", "B"]); // queue drained after the failed turn
+      expect(sent).toEqual(["A", "B", "X"]);
       expect(s.running).toBe(false);
       expect(s.queue).toHaveLength(0);
-      expect(errors).toEqual(["boom"]);
+      expect(errors).toEqual([]);
       // the error notice was retired when the next turn started
       expect(notices(m, "s1")).toHaveLength(0);
-      await new Promise((r) => setTimeout(r, 10));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sent).toEqual(["A", "B", "X"]);
       expect(rejections).toEqual([]);
     } finally {
       regions.beginTurn = beginTurn;
       process.off("unhandledRejection", onRejection);
+      vi.clearAllTimers();
+      vi.useRealTimers();
     }
   });
 
