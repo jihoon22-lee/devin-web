@@ -55,6 +55,25 @@ const item = (id: string, extra: Partial<AssembledItem> = {}): AssembledItem => 
 });
 
 describe("itemLog", () => {
+  it("rolls back final snapshot replacement on SQLite failure and retries intact", () => {
+    const before = item("atomic-thought", { role: "thought", text: "before" });
+    itemLogSave("atomic", "t", 100, [before]);
+    const d = openDb(join(stateDir, "itemlog.db"));
+    d.exec(`CREATE TRIGGER reject_final BEFORE INSERT ON items WHEN NEW.text = 'after'
+      BEGIN SELECT RAISE(ABORT, 'injected write failure'); END`);
+    const latest = { startNode: 100, items: [{ ...before, text: "after", done: true, seqTo: 2 }] };
+    try {
+      expect(itemLogFinalize("atomic", "t", new Map([[before.id, 101]]), latest)).toBe(false);
+      itemLogResetForTests();
+      expect(itemLogRestore("atomic")?.items).toEqual([before]);
+      expect(itemLogLoadRetained("atomic")).toEqual([]);
+      d.exec("DROP TRIGGER reject_final");
+      expect(itemLogFinalize("atomic", "t", new Map([[before.id, 101]]), latest)).toBe(true);
+      itemLogResetForTests();
+      expect(itemLogLoadRetained("atomic")).toEqual([{ ...latest.items[0], anchorNode: 101 }]);
+    } finally { d.close(); }
+  });
+
   it("restores a saved turn's items in order after reopen", () => {
     itemLogSave("s1", "t1", 100, [
       item("p-t1-0", { role: "thought", text: "thinking" }),

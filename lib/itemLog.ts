@@ -198,12 +198,32 @@ export function itemLogFinalize(
   sessionId: string,
   turnId: string,
   keep: Map<string, number>,
-) {
+  latest?: { startNode: number; items: AssembledItem[] },
+): boolean {
   const d = db();
-  if (!d) return;
+  if (!d) return false;
   try {
     d.exec("BEGIN");
     try {
+      // The final event can beat the coalesced save. Persist the final
+      // assembler snapshot in THIS transaction before selecting retained rows.
+      if (latest) {
+        d.prepare(`INSERT INTO turns(session_id, turn_id, start_node, ended)
+          VALUES (?,?,?,1) ON CONFLICT(session_id,turn_id) DO UPDATE SET ended=1`)
+          .run(sessionId, turnId, latest.startNode);
+        d.prepare("DELETE FROM items WHERE session_id = ? AND turn_id = ?").run(sessionId, turnId);
+        const insert = d.prepare(`INSERT INTO items
+          (session_id,turn_id,item_id,ord,kind,role,text,tool,payload,done,seq_from,seq_to)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+        latest.items.forEach((it, ord) => {
+          if (!keep.has(it.id)) return;
+          const { entries, mentions, requestId, method, params, resolved } = it;
+          insert.run(sessionId, turnId, it.id, ord, it.kind, it.role ?? null,
+            it.text ?? null, it.tool ? JSON.stringify(it.tool) : null,
+            JSON.stringify({ entries, mentions, requestId, method, params, resolved }),
+            it.done ? 1 : 0, it.seqFrom, it.seqTo);
+        });
+      }
       const del = d.prepare(
         "DELETE FROM items WHERE session_id = ? AND turn_id = ? AND item_id = ?",
       );
@@ -226,18 +246,15 @@ export function itemLogFinalize(
         "UPDATE turns SET retained = 1 WHERE session_id = ? AND turn_id = ?",
       ).run(sessionId, turnId);
       d.exec("COMMIT");
-      // re-baseline the write-amplification tracker to the kept set — a
-      // (legal) later save of this turn must not resurrect deleted items
-      const prev = lastSaved.get(sessionId);
-      if (prev?.turnId === turnId) {
-        for (const id of [...prev.sigs.keys()]) if (!keep.has(id)) prev.sigs.delete(id);
-      }
+      lastSaved.delete(sessionId);
+      return true;
     } catch (e) {
       d.exec("ROLLBACK");
       throw e;
     }
   } catch {
-    /* non-fatal — the caller's flip path falls back to drop */
+    // Preserve the previous log on rollback; the caller retains the region.
+    return false;
   }
 }
 

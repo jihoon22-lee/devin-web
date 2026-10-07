@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const stateDir = mkdtempSync(join(tmpdir(), "dw-mgr-state-"));
 process.env.DEVIN_WEB_STATE_DIR = stateDir;
@@ -922,6 +922,7 @@ describe("subscription bookkeeping", () => {
 });
 
 describe("provisional region (two-region transcript)", () => {
+  beforeEach(async () => { (await import("../lib/itemLog")).itemLogForget("s1"); });
   const openSession = async (m: SessionManager, sid = "s1") => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const mi = m as any;
@@ -1507,4 +1508,157 @@ describe("deleteSession lock guard", () => {
     loaded(m, "s-free");
     await expect(m.deleteSession("s-free")).resolves.toBeTruthy();
   });
+});
+
+
+describe("adopted concurrent prompt completion", () => {
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  it.each([true, false])("holds persisted queue until daemon idle (count protocol: %s)", async (counted) => {
+    const m = stubbed();
+    const mi = m as any;
+    let busy = true;
+    vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+    vi.spyOn(m.bridge, "daemonState").mockImplementation(async () => ({ gen: 1,
+      sessions: [{ sessionId: "concurrent", cwd: "/tmp", loadResult: {}, busy }] }));
+    const sent: string[] = [];
+    mi.bridge.request = (method: string, params: any) => {
+      if (method === METHODS.sessionPrompt) { sent.push(params.prompt[0].text); return new Promise(() => {}); }
+      return Promise.resolve({});
+    };
+    await m.loadSession("concurrent", "/tmp");
+    await m.prompt("concurrent", [{ type: "text", text: "parked" }] as never);
+    mi.emit("concurrent", "session_update", { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "still working" } });
+    mi.onNotification("_devin-web/turn_end", { sessionId: "concurrent", ...(counted ? { remainingPrompts: 1 } : {}) });
+    await new Promise((r) => setImmediate(r));
+    expect(sent).toEqual([]);
+    expect(m.getSession("concurrent")?.running).toBe(true);
+    expect(mi.regions.turnOpen("concurrent")).toBe(true);
+    busy = false;
+    mi.onNotification("_devin-web/turn_end", { sessionId: "concurrent", ...(counted ? { remainingPrompts: 0 } : {}) });
+    await new Promise((r) => setImmediate(r));
+    expect(sent).toEqual(["parked"]);
+  });
+
+  it.each([false, true])("settling a local steer cannot close the adopted original (failure: %s)", async (failed) => {
+    const m = stubbed(), mi = m as any;
+    const sessionId = `adopt-steer-${failed}`;
+    let busy = true;
+    vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+    vi.spyOn(m.bridge, "daemonState").mockImplementation(async () => ({ gen: 1,
+      sessions: [{ sessionId, cwd: "/tmp", loadResult: {}, busy }] }));
+    let resolve!: (value: unknown) => void, reject!: (error: Error) => void;
+    const prompts: string[] = [];
+    mi.bridge.request = (method: string, params: any) => {
+      if (method !== METHODS.sessionPrompt) return Promise.resolve({});
+      prompts.push(params.prompt[0].text);
+      return new Promise((yes, no) => { resolve = yes; reject = no; });
+    };
+    await m.loadSession(sessionId, "/tmp");
+    await m.prompt(sessionId, [{ type: "text", text: "steer" }] as never);
+    const id = mi.sessions.get(sessionId).queue[0].id;
+    await m.prompt(sessionId, [{ type: "text", text: "after" }] as never);
+    m.sendQueuedNow(sessionId, id);
+    if (failed) reject(new Error("steer failed")); else resolve({});
+    await new Promise((r) => setImmediate(r));
+    expect(prompts).toEqual(["steer"]);
+    expect(m.getSession(sessionId)?.running).toBe(true);
+    expect(mi.regions.turnOpen(sessionId)).toBe(true);
+    busy = false;
+    mi.onNotification("_devin-web/turn_end", { sessionId, remainingPrompts: 0 });
+    await new Promise((r) => setImmediate(r));
+    expect(prompts).toEqual(["steer", failed ? "steer" : "after"]);
+  });
+
+  it.each([false, true])("reconciles an unconfirmed completion on reconnect without draining a busy turn (legacy: %s)", async (legacy) => {
+    const m = new SessionManager(), mi = m as any;
+    const sessionId = `reconcile-idle-${legacy}`;
+    vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+    vi.spyOn(m.bridge, "ensure").mockResolvedValue({} as never);
+    let state: Awaited<ReturnType<typeof m.bridge.daemonState>> = null;
+    vi.spyOn(m.bridge, "daemonState").mockImplementation(async () => state);
+    const sent: string[] = [];
+    mi.bridge.request = (method: string, params: any) => {
+      if (method === METHODS.sessionPrompt) { sent.push(params.prompt[0].text); return new Promise(() => {}); }
+      return Promise.resolve({});
+    };
+    mi.sessions.set(sessionId, { sessionId, cwd: "/tmp", loaded: true, running: true,
+      attachedGen: mi.generation, queue: [{ id: "q-reconcile", blocks: [{ type: "text", text: "later" }] }] });
+    mi.onNotification("_devin-web/turn_end", { sessionId, ...(legacy ? {} : { remainingPrompts: 0 }) });
+    await new Promise((r) => setImmediate(r));
+    expect(sent).toEqual([]);
+    await m.ensure(); // unavailable stays conservative across reconnect
+    expect(sent).toEqual([]);
+    state = { gen: 1, sessions: [{ sessionId, cwd: "/tmp", loadResult: {}, busy: true }] };
+    await m.ensure();
+    expect(sent).toEqual([]);
+    state.sessions[0].busy = false;
+    await m.ensure();
+    expect(sent).toEqual(["later"]);
+    await m.ensure();
+    expect(sent).toEqual(["later"]); // locally owned new turn is never closed by a stale idle snapshot
+    mi.dbSub?.();
+  });
+
+  it("does not mistake an unavailable legacy daemon query for idle", async () => {
+    const m = stubbed(), mi = m as any;
+    vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+    vi.spyOn(m.bridge, "daemonState").mockResolvedValue(null);
+    mi.sessions.set("unknown", { sessionId: "unknown", cwd: "/tmp", loaded: true, running: true, attachedGen: mi.generation, queue: [] });
+    mi.onNotification("_devin-web/turn_end", { sessionId: "unknown" });
+    await new Promise((r) => setImmediate(r));
+    expect(m.getSession("unknown")?.running).toBe(true);
+  });
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+});
+
+describe("review: prompt completion generation ownership", () => {
+  it("an old daemon-state reply cannot clear ownership of a replacement generation's prompt", async () => {
+    const m = stubbed();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mi = m as any;
+    const sessionId = "review-generation";
+    const s = { sessionId, cwd: "/tmp", loaded: true, running: false, attachedGen: 0, queue: [] };
+    mi.sessions.set(sessionId, s);
+    vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+    let completeOld!: (value: unknown) => void;
+    let resolveState!: (state: unknown) => void;
+    mi.bridge.request = (method: string) => method === METHODS.sessionPrompt
+      ? new Promise((resolve) => { completeOld = resolve; }) : Promise.resolve({});
+    mi.bridge.daemonState = () => new Promise((resolve) => { resolveState = resolve; });
+    await m.prompt(sessionId, [{ type: "text", text: "old" }]);
+    completeOld({});
+    await new Promise((r) => setImmediate(r));
+    mi.bridge.handlers.onExit(null, null);
+    s.attachedGen = mi.generation; // the same session object has reattached
+    await m.prompt(sessionId, [{ type: "text", text: "replacement" }]);
+    expect(mi.sessions.get(sessionId).ownsTurn).toBe(true);
+    resolveState({ gen: 0, sessions: [{ sessionId, busy: false }] });
+    await new Promise((r) => setImmediate(r));
+    expect(mi.sessions.get(sessionId).ownsTurn).toBe(true);
+    expect(mi.sessions.get(sessionId).running).toBe(true);
+  });
+});
+
+it("a stale send-now settlement does not decrement the next generation's steer count", async () => {
+  const m = stubbed();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mi = m as any;
+  const sessionId = "review-steer-generation";
+  const s = { sessionId, cwd: "/tmp", loaded: true, running: true, attachedGen: 0,
+    queue: [{ id: "q-old", blocks: [{ type: "text", text: "old steer" }] }] };
+  mi.sessions.set(sessionId, s);
+  vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+  const settle: ((value: unknown) => void)[] = [];
+  mi.bridge.request = () => new Promise((resolve) => { settle.push(resolve); });
+  mi.bridge.daemonState = async () => ({ gen: mi.generation, sessions: [{ sessionId, busy: true }] });
+  m.sendQueuedNow(sessionId, "q-old");
+  mi.bridge.handlers.onExit(null, null);
+  s.attachedGen = mi.generation;
+  s.running = true;
+  s.queue.push({ id: "q-new", blocks: [{ type: "text", text: "new steer" }] });
+  m.sendQueuedNow(sessionId, "q-new");
+  expect(mi.sessions.get(sessionId).steerInFlight).toBe(1);
+  settle[0]({});
+  await new Promise((r) => setImmediate(r));
+  expect(mi.sessions.get(sessionId).steerInFlight).toBe(1);
 });

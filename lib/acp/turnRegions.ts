@@ -11,7 +11,7 @@ export interface TurnRegionStorage {
   save(sessionId: string, turnId: string, startNode: number, items: AssembledItem[], ended: boolean): void;
   clearExcept(sessionId: string, turnId: string): void;
   drop(sessionId: string, turnId: string): void;
-  finalize(sessionId: string, turnId: string, anchors: Map<string, number>): void;
+  finalize(sessionId: string, turnId: string, anchors: Map<string, number>, latest?: { startNode: number; items: AssembledItem[] }): boolean | void;
   pruneRetained(sessionId: string): void;
   forget(sessionId: string): void;
 }
@@ -57,6 +57,7 @@ export class TurnRegions {
     { asm: ItemAssembler; turnId: string; turnStartNode: number; ended: boolean }
   >();
   private turnSeq = 0;
+  private failedFinalizations = new Map<string, string>();
   /** sessions whose provisional region changed since the last flush */
   private provDirty = new Set<string>();
   /** sessions already given a one-shot itemlog restore attempt */
@@ -126,29 +127,47 @@ export class TurnRegions {
     if (items.length) this.retainedBy.set(sessionId, capRetainedTurns(items));
   }
 
+  private noteFinalizeFailure(sid: string, turnId: string, stage: "alignment" | "storage") {
+    if (this.failedFinalizations.get(sid) === turnId) return;
+    this.failedFinalizations.set(sid, turnId);
+    noteIntegrityBeacon("server:turnFinalizeFailed");
+    console.error(`[integrity] ${sid} turnFinalizeFailed stage=${stage}`);
+  }
+
   /** Turn flip: durable covers the ended turn. Spine items are superseded by
    *  their durable twins; counterpart-less items (thoughts, plans) are
-   *  retained with anchors inside the turn's row range. Best-effort — any
-   *  failure falls back to the plain drop so the flip itself never fails. */
+   *  retained with anchors inside the turn's row range. A failed write keeps
+   *  the provisional region for a later retry. */
   private finalizeTurn(
     sid: string,
     ps: { asm: ItemAssembler; turnId: string; turnStartNode: number },
   ) {
+    let alignment: ReturnType<typeof computeAnchors>;
     try {
       const tip = this.deps.maxNode(sid);
-      const { anchors, violations } = computeAnchors(
+      alignment = computeAnchors(
         ps.asm.list(),
         this.deps.spineRows(sid, ps.turnStartNode, tip),
         ps.turnStartNode,
         tip,
       );
+    } catch {
+      this.noteFinalizeFailure(sid, ps.turnId, "alignment");
+      // Save the latest closed assembler even if alignment could not run.
+      // A restart can then retry without discarding the last unflushed text.
+      this.deps.storage.save(sid, ps.turnId, ps.turnStartNode, ps.asm.list(), true);
+      return false;
+    }
+    try {
+      const { anchors, violations } = alignment;
       if (violations.length) {
         noteIntegrityBeacon("server:anchorOutOfTurn");
         console.error(`[integrity] ${sid} anchorOutOfTurn ${violations.join(",")}`);
       }
       if (!anchors.size) {
         this.deps.storage.drop(sid, ps.turnId);
-        return;
+        this.failedFinalizations.delete(sid);
+        return true;
       }
       const kept = ps.asm
         .list()
@@ -160,11 +179,19 @@ export class TurnRegions {
           delete kept.revisions;
           return kept;
         });
+      if (this.deps.storage.finalize(sid, ps.turnId, anchors, {
+        startNode: ps.turnStartNode, items: ps.asm.list(),
+      }) === false) {
+        this.noteFinalizeFailure(sid, ps.turnId, "storage");
+        return false;
+      }
+      this.failedFinalizations.delete(sid);
       this.retainedBy.set(sid, capRetainedTurns([...(this.retainedBy.get(sid) ?? []), ...kept]));
-      this.deps.storage.finalize(sid, ps.turnId, anchors);
       this.deps.storage.pruneRetained(sid); // disk and memory share the same turn budget
+      return true;
     } catch {
-      this.deps.storage.drop(sid, ps.turnId);
+      this.noteFinalizeFailure(sid, ps.turnId, "storage");
+      return false;
     }
   }
 
@@ -177,8 +204,8 @@ export class TurnRegions {
     for (const [sid, ps] of this.prov) {
       if (!ps.ended) continue;
       if (this.deps.maxNode(sid) > ps.turnStartNode) {
+        if (!this.finalizeTurn(sid, ps)) continue;
         this.prov.delete(sid);
-        this.finalizeTurn(sid, ps);
         dropped = true;
         const regions = {
           provisional: [],
@@ -206,6 +233,7 @@ export class TurnRegions {
   }
 
   beginTurn(sessionId: string) {
+    this.failedFinalizations.delete(sessionId);
     // runId makes the turn id unique across web restarts — itemlog rows are
     // keyed (session_id, item_id) and item ids embed the turn id, so a
     // reused `t1` after restart would upsert INTO the stale turn's rows
@@ -239,8 +267,7 @@ export class TurnRegions {
       // instead of dropping (the live flip never ran while we were down)
       const asm = new ItemAssembler(r.turnId);
       asm.restore(r.items);
-      this.finalizeTurn(sessionId, { asm, turnId: r.turnId, turnStartNode: r.startNode });
-      return;
+      if (this.finalizeTurn(sessionId, { asm, turnId: r.turnId, turnStartNode: r.startNode })) return;
     }
     const asm = new ItemAssembler(r.turnId);
     asm.restore(r.items);
@@ -358,6 +385,7 @@ export class TurnRegions {
 
   /** Session deletion also cancels its pending flush and restart state. */
   forget(sessionId: string): void {
+    this.failedFinalizations.delete(sessionId);
     this.deps.invalidateDurable(sessionId);
     this.prov.delete(sessionId);
     this.provDirty.delete(sessionId);
