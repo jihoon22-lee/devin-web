@@ -265,3 +265,92 @@ describe("composer across sessions and snippets", () => {
     resetUiPrefsForTest();
   });
 });
+
+describe("pending send recovery", () => {
+  const restore = (sessionId: string, label: string) => window.dispatchEvent(new CustomEvent("dw-restore", {
+    detail: { sessionId, blocks: [
+      { type: "text", text: `${label} @${label}.ts` },
+      { type: "resource_link", uri: `file:///tmp/${label}.ts`, name: `${label}.ts` },
+      { type: "image", data: label, mimeType: "image/png" },
+    ] },
+  }));
+  it.each([false, true])("merges failed send into its origin while preserving newer drafts (switch=%s)", async (switchSession) => {
+    let reject!: (e: Error) => void;
+    sendPrompt.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; }));
+    const revoke = vi.fn();
+    Object.assign(URL, { revokeObjectURL: revoke });
+    const r = render(<ChatInput sessionId="s1" cwd="/tmp" state={emptySessionState()} />);
+    await act(async () => {});
+    act(() => { restore("s1", "original"); });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    act(() => { restore("s1", "newer"); });
+    if (switchSession) {
+      await act(async () => { r.rerender(<ChatInput sessionId="s2" cwd="/tmp" state={emptySessionState()} />); });
+      act(() => { restore("s2", "other"); });
+    }
+    await act(async () => { reject(new Error("offline")); });
+    if (switchSession) {
+      expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("other @other.ts");
+      expect(document.querySelectorAll("img").length).toBe(1);
+      await act(async () => { r.rerender(<ChatInput sessionId="s1" cwd="/tmp" state={emptySessionState()} />); });
+    }
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("newer @newer.ts\noriginal @original.ts");
+    expect(document.querySelectorAll("img").length).toBe(2);
+    expect(revoke).not.toHaveBeenCalled();
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Send" })); });
+    expect(sendPrompt).toHaveBeenLastCalledWith("s1", "newer @newer.ts\noriginal @original.ts",
+      [{ data: "newer", mimeType: "image/png" }, { data: "original", mimeType: "image/png" }],
+      [{ path: "/tmp/newer.ts", name: "newer.ts" }, { path: "/tmp/original.ts", name: "original.ts" }]);
+  });
+});
+
+it("ignores late history responses from a previous session", async () => {
+  let resolve!: (r: { prompts: string[] }) => void;
+  vi.mocked(api).mockImplementation(((path: string) => path.includes("/s1/history")
+    ? new Promise<{ prompts: string[] }>((done) => { resolve = done; }) : Promise.resolve({ prompts: ["B history"] })) as typeof api);
+  const view = render(<ChatInput sessionId="s1" cwd="/tmp" state={emptySessionState()} />);
+  await act(async () => {});
+  await act(async () => { view.rerender(<ChatInput sessionId="s2" cwd="/tmp" state={emptySessionState()} />); });
+  await act(async () => { resolve({ prompts: ["A history"] }); });
+  fireEvent.keyDown(screen.getByRole("textbox"), { key: "ArrowUp" });
+  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("B history");
+});
+
+it("recovers a send that fails after the composer unmounts into its origin draft", async () => {
+  vi.mocked(api).mockResolvedValue({ prompts: [] });
+  let reject!: (e: Error) => void;
+  sendPrompt.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; }));
+  const view = render(<ChatInput sessionId="s1" cwd="/tmp" state={emptySessionState()} />);
+  await act(async () => {});
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: "unsent prompt" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  view.unmount();
+  await act(async () => { reject(new Error("offline")); });
+  await mount(emptySessionState());
+  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("unsent prompt");
+});
+
+it("does not offer the previous session's history while the new history is loading", async () => {
+  vi.mocked(api).mockImplementation(((path: string) => path.includes("/s1/history")
+    ? Promise.resolve({ prompts: ["A history"] }) : new Promise(() => {})) as typeof api);
+  const view = render(<ChatInput sessionId="s1" cwd="/tmp" state={emptySessionState()} />);
+  await act(async () => {});
+  await act(async () => { view.rerender(<ChatInput sessionId="s2" cwd="/tmp" state={emptySessionState()} />); });
+  fireEvent.keyDown(screen.getByRole("textbox"), { key: "ArrowUp" });
+  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
+});
+
+it("merges a former composer's failed send into a newly mounted composer for the same session", async () => {
+  vi.mocked(api).mockResolvedValue({ prompts: [] });
+  let reject!: (e: Error) => void;
+  sendPrompt.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; }));
+  const view = render(<ChatInput sessionId="s1" cwd="/tmp" state={emptySessionState()} />);
+  await act(async () => {});
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: "old unsent" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  view.unmount();
+  await mount(emptySessionState());
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: "new draft" } });
+  await act(async () => { reject(new Error("offline")); });
+  expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("new draft\nold unsent");
+});
