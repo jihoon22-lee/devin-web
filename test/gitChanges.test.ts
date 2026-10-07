@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   changedFiles, COMMIT_TIMEOUT_MS, commitStaged, filePatch, isSafeRelPath, parseNumstatZ,
   parsePorcelainZ, revertFile, stageFile, unstageFile,
@@ -55,6 +55,19 @@ describe("parsers", () => {
 });
 
 describe("changedFiles / filePatch", () => {
+  it("discards only the requested repository despite inherited Git locator variables", async () => {
+    const a = repo(true), b = repo(true);
+    writeFileSync(join(a.d, "base.txt"), "requested edit\n");
+    writeFileSync(join(b.d, "base.txt"), "unrelated edit\n");
+    vi.stubEnv("GIT_DIR", join(b.d, ".git"));
+    vi.stubEnv("GIT_WORK_TREE", b.d);
+    vi.stubEnv("GIT_INDEX_FILE", join(b.d, ".git/index"));
+    try { await revertFile(a.d, "base.txt"); }
+    finally { vi.unstubAllEnvs(); }
+    expect(readFileSync(join(a.d, "base.txt"), "utf8")).toBe("one\n");
+    expect(readFileSync(join(b.d, "base.txt"), "utf8")).toBe("unrelated edit\n");
+  });
+
   it("reverts both paths of a staged rename without leaving a staged deletion", async () => {
     const { d, g } = repo(true);
     g("mv", "base.txt", "한글 [new].txt");

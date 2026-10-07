@@ -5,6 +5,11 @@
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { GIT_REPOSITORY_ENV } from "../lib/gitEnv.mjs";
+
+// Git invokes hooks with repository locators in the environment. Fixture
+// commands must never inherit a live checkout's index/object/worktree paths.
+for (const key of GIT_REPOSITORY_ENV) delete process.env[key];
 
 delete process.env.DEVIN_WEB_ACP_SOCK;
 delete process.env.DEVIN_WEB_HOST_SOCK;

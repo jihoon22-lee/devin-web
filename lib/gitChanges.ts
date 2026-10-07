@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { gitEnvironment } from "./gitEnv.mjs";
 
 /** git's well-known empty tree — the diff base in repositories with no commits */
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -33,7 +34,7 @@ export function git(cwd: string, args: string[], opts: GitOpts = {}): Promise<st
     execFile(
       "git",
       ["--literal-pathspecs", "-C", cwd, "-c", "core.quotePath=false", ...args],
-      { timeout: opts.timeoutMs ?? 10_000, maxBuffer: 8 * 1024 * 1024 },
+      { timeout: opts.timeoutMs ?? 10_000, maxBuffer: 8 * 1024 * 1024, env: gitEnvironment() },
       (e, out) => {
         if (!e) return resolve(out);
         if (opts.okExit1 && (e as { code?: unknown }).code === 1) return resolve(out);
