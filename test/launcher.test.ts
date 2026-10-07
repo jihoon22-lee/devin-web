@@ -198,10 +198,10 @@ describe("public launcher boundaries", () => {
     expect(readFileSync(join(root, "state/pid"), "utf8")).toBe(String(sleeper.pid));
     expect(readFileSync(join(root, "state/web.disabled"), "utf8")).toBe("keep");
   });
-  it("ctl starts on PORT and carries custom dist and clean socket settings through restart", async () => {
+  it.each(["", "000"])("ctl starts on PORT with prefix %j and carries custom dist and clean sockets through restart", async (prefix) => {
     const root = serviceFixture(); const port = await freePort();
     mkdirSync(join(root, "custom-build")); writeFileSync(join(root, "custom-build/BUILD_ID"), "build");
-    const settings = { PORT: port, DEVIN_WEB_ACPD: "0", DEVIN_WEB_DIST_DIR: "custom-build", DEVIN_WEB_ACP_SOCK: "/unrelated-acp", DEVIN_WEB_HOST_SOCK: "/unrelated-host", HOST: "0.0.0.0" };
+    const settings = { PORT: prefix + port, DEVIN_WEB_ACPD: "0", DEVIN_WEB_DIST_DIR: "custom-build", DEVIN_WEB_ACP_SOCK: "/unrelated-acp", DEVIN_WEB_HOST_SOCK: "/unrelated-host", HOST: "0.0.0.0" };
     try {
       expect((await ctl(root, ["start"], settings)).code).toBe(0);
       const before = readFileSync(join(root, "state/pid"), "utf8");
