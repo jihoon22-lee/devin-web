@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "checkJs": true,
+    "allowJs": true,
+    "noEmit": true,
+    "strict": false,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "esnext",
+    "skipLibCheck": true,
+    "types": ["node"],
+    "lib": ["esnext"]
+  },
+  "include": ["lib/acp/*.mjs", "bin/*.mjs", "lib/acp/wire.d.ts"]
+}

@@ -1,0 +1,94 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typegen && pnpm verify
+      - run: pnpm docs:check && pnpm public:check && node bin/check-audit.mjs
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:e2e
+      - run: pnpm test:daemon
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: fixture-browser-failures
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+  secrets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: bash bin/scan-secrets.sh
+  dependency-review:
+    if: github.event_name == 'pull_request' && !github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
+  gate:
+    name: CI Gate
+    if: always()
+    needs: [quality, browser, secrets, dependency-review]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every applicable check
+        env:
+          QUALITY: ${{ needs.quality.result }}
+          BROWSER: ${{ needs.browser.result }}
+          SECRETS: ${{ needs.secrets.result }}
+          DEPENDENCIES: ${{ needs.dependency-review.result }}
+          REQUIRE_DEPENDENCIES: ${{ github.event_name == 'pull_request' && !github.event.repository.private }}
+        run: |
+          test "$QUALITY" = success
+          test "$BROWSER" = success
+          test "$SECRETS" = success
+          if [ "$REQUIRE_DEPENDENCIES" = true ]; then test "$DEPENDENCIES" = success; else test "$DEPENDENCIES" = skipped; fi

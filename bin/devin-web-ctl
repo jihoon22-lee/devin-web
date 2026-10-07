@@ -1,0 +1,478 @@
+#!/usr/bin/env bash
+# devin-web-ctl — start|stop|restart|status for devin-web + devin-acpd.
+#
+# Two process groups, two pidfiles:
+#   devin-acpd (setsid, own group) owns `devin acp` — survives web restarts,
+#     so an in-flight turn is never killed by a deploy.
+#   devin-web  (setsid, own group) the Next server — restart/stop touch ONLY
+#     this group. `stop --all` also stops the daemon (and the agent with it).
+# DEVIN_WEB_ACPD=0 disables the daemon → web spawns `devin acp` itself
+# (legacy in-process mode, turns die on restart).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE="${DEVIN_WEB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/devin-web}"
+[[ $STATE == /* ]] || STATE="$PWD/$STATE"
+PIDFILE="$STATE/pid"
+LOG="$STATE/server.log"
+ACPD_PIDFILE="${DEVIN_WEB_ACPD_PIDFILE:-$STATE/acpd.pid}"
+ACPD_LOG="$STATE/acpd.log"
+ACPD_SOCK="${DEVIN_WEB_ACP_SOCK:-$STATE/acp.sock}"
+HOST_SOCK="${DEVIN_WEB_HOST_SOCK:-$STATE/host.sock}"
+PORT="${DEVIN_WEB_PORT-${PORT-7100}}"
+URL="http://127.0.0.1:$PORT"
+ACPD_ENABLED="${DEVIN_WEB_ACPD:-1}"
+WATCH_PIDFILE="$STATE/web-watch.pid"
+WATCH_LOG="$STATE/web-watch.log"
+DISABLED="$STATE/web.disabled"   # marker: an intentional `stop` stays down
+ACPD_IDLE_PIDFILE="$STATE/acpd-idle-restart.pid"
+ACPD_WATCH_LOG="$STATE/acpd-watch.log"
+
+# Freeze the resolved configuration for the daemon, web and watchdog re-drives.
+# Ambient HOST never changes the managed loopback bind.
+export DEVIN_WEB_STATE_DIR="$STATE" DEVIN_WEB_PORT="$PORT" PORT
+export DEVIN_WEB_DIST_DIR="${DEVIN_WEB_DIST_DIR-.next}"
+export DEVIN_WEB_ACPD="$ACPD_ENABLED" DEVIN_WEB_ACP_FALLBACK=0
+export DEVIN_WEB_ACPD_PIDFILE="$ACPD_PIDFILE"
+if [[ $ACPD_ENABLED == 0 ]]; then
+  unset DEVIN_WEB_ACP_SOCK DEVIN_WEB_HOST_SOCK
+fi
+
+preflight() { node "$ROOT/bin/runtime.mjs" "$@"; }
+
+# Only use this with a PID captured by this invocation's own launch. Existing
+# daemon and watch processes are never candidates for failed-start cleanup.
+cleanup_created() {
+  local pid="$1" file="$2"
+  [[ -n $pid ]] || return 0
+  kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 -- -"$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+  fi
+  if [[ -f $file && $(cat "$file") == "$pid" ]]; then rm -f "$file"; fi
+}
+
+pid_alive() { [[ -f $1 ]] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+# The state dir holds the agent/terminal sockets, pidfiles, tags and the
+# search cache — owner-only. `mkdir -p` alone keeps whatever mode an older
+# run created (0775 under a 002 umask), so tighten it every time.
+ensure_state() {
+  mkdir -p "$STATE"
+  chmod 700 "$STATE"
+}
+
+# pid listening on 127.0.0.1:$PORT (or wildcard), if any
+port_owners() {
+  ss -tlnp 2>/dev/null | grep -E "(127\.0\.0\.1|0\.0\.0\.0|\[::\]|\*):$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u
+}
+port_owner() { port_owners | head -1; }
+
+restart_preflight() {
+  preflight || return 1
+  # A free target is safe. An occupied target is safe only when every listener
+  # belongs to the current managed wrapper's process tree, which stop replaces.
+  if preflight --check-port >/dev/null 2>&1; then return 0; fi
+  local owners owner target p ppid ours
+  owners="$(port_owners || true)"
+  if ! pid_alive "$PIDFILE" || [[ -z $owners ]]; then
+    echo "error: cannot restart on occupied or unavailable port $PORT — existing web left running" >&2
+    return 1
+  fi
+  target="$(cat "$PIDFILE")"
+  for owner in $owners; do
+    p="$owner"; ours=0
+    while [[ $p =~ ^[0-9]+$ && $p -gt 1 ]]; do
+      if [[ $p == "$target" ]]; then ours=1; break; fi
+      ppid="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d '[:space:]')"
+      p="$ppid"
+    done
+    if [[ $ours != 1 ]]; then
+      echo "error: port $PORT belongs to another process (pid $owner) — existing web left running" >&2
+      return 1
+    fi
+  done
+}
+
+stop_tree() { # $1=pidfile — kill the whole process group, then the pid
+  local pid
+  pid="$(cat "$1")"
+  kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 -- -"$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$1"
+}
+
+# ---------------- web watchdog ----------------
+# devin-web-watch resurrects the server when it dies unattended (crash,
+# OOM, a nested restart that never reached `start`). An explicit `stop`
+# drops $DISABLED first — supervision must never undo an intentional stop.
+watch_start() {
+  pid_alive "$WATCH_PIDFILE" && return 0
+  ensure_state
+  rm -f "$WATCH_PIDFILE"
+  setsid nohup env "DEVIN_WEB_PORT=$PORT" "DEVIN_WEB_STATE_DIR=$STATE" \
+    node "$ROOT/bin/devin-web-watch.mjs" >>"$WATCH_LOG" 2>&1 &
+}
+
+watch_stop() {
+  if pid_alive "$WATCH_PIDFILE"; then stop_tree "$WATCH_PIDFILE"; else rm -f "$WATCH_PIDFILE"; fi
+}
+
+# A caller inside the web process tree (an agent's exec PTY is a child of
+# this server) dies the moment `stop` lands — the process-group kill or
+# the SIGHUP when its controlling pty closes takes it down before `start`
+# can run, leaving the web dead with no pidfile (the 9-19 incident). Run
+# the real work in a detached re-drive so stop+start completes.
+web_ancestor() {
+  pid_alive "$PIDFILE" || return 1
+  local target p=$$ ppid
+  target="$(cat "$PIDFILE")"
+  while [[ $p -gt 1 ]]; do
+    [[ $p == "$target" ]] && return 0
+    ppid="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d '[:space:]')"
+    [[ $ppid =~ ^[0-9]+$ ]] || return 1
+    p=$ppid
+  done
+  return 1
+}
+
+redrive_if_nested() {
+  [[ -n ${DEVIN_WEB_DETACHED:-} ]] && return 1 # already the detached copy
+  web_ancestor || return 1                     # outside the web tree — run inline
+  echo "called from inside the devin-web process tree — re-driving detached (see $LOG)" >&2
+  setsid env DEVIN_WEB_DETACHED=1 "$ROOT/bin/devin-web-ctl" "$@" </dev/null >>"$LOG" 2>&1 &
+}
+
+# ---------------- devin-acpd ----------------
+
+# `devin acp` processes reparented to init — their owning daemon (or web,
+# in legacy spawn mode) died and left them behind, still holding session
+# locks. A CLI/web-owned acp has a live non-init parent — never matched.
+orphan_acp_pids() {
+  local p ppid pattern
+  pattern="$(printf '%s' "${DEVIN_WEB_DEVIN_BIN:-devin}" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
+  for p in $(pgrep -f -- "$pattern acp" 2>/dev/null); do
+    ppid="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d '[:space:]')"
+    [[ $ppid == 1 ]] && echo "$p"
+  done
+}
+
+acpd_start() {
+  STARTED_ACPD_PID=""
+  if pid_alive "$ACPD_PIDFILE"; then
+    echo "devin-acpd already running (pid $(cat "$ACPD_PIDFILE"))"
+    return 0
+  fi
+  preflight || return 1
+  # an orphaned acp still holds the session locks — a fresh daemon would
+  # spawn a SECOND agent competing for them (the lock-conflict split-brain)
+  local orphans
+  orphans="$(orphan_acp_pids || true)"
+  if [[ -n ${orphans//[[:space:]]/} ]]; then
+    echo "error: orphaned 'devin acp' still alive: $(echo "$orphans" | tr '\n' ' ')" >&2
+    echo "  a new daemon would spawn a second agent competing for session locks." >&2
+    echo "  kill it first, or override: DEVIN_WEB_ACPD_FORCE=1 $0 acpd start" >&2
+    [[ ${DEVIN_WEB_ACPD_FORCE:-0} == 1 ]] || return 1
+    echo "  proceeding anyway (DEVIN_WEB_ACPD_FORCE=1)" >&2
+  fi
+  ensure_state
+  rm -f "$ACPD_PIDFILE"
+  # rotate a fat log (keep one generation) — the daemon lives for weeks and
+  # relays the agent's stderr tracing verbatim
+  if [[ -f $ACPD_LOG ]] && [[ $(stat -c%s "$ACPD_LOG" 2>/dev/null || stat -f%z "$ACPD_LOG") -gt 5242880 ]]; then
+    mv "$ACPD_LOG" "$ACPD_LOG.1"
+  fi
+  setsid nohup env "DEVIN_WEB_STATE_DIR=$STATE" "DEVIN_WEB_ACP_SOCK=$ACPD_SOCK" "DEVIN_WEB_HOST_SOCK=$HOST_SOCK" node "$ROOT/bin/devin-acpd.mjs" >>"$ACPD_LOG" 2>&1 &
+  STARTED_ACPD_PID=$!
+  # the daemon writes its own pidfile — $! here can be a short-lived wrapper
+  for _ in $(seq 1 40); do
+    if [[ -S $ACPD_SOCK ]] && pid_alive "$ACPD_PIDFILE"; then
+      echo "devin-acpd up (pid $(cat "$ACPD_PIDFILE")) → $ACPD_SOCK"
+      return 0
+    fi
+    kill -0 "$STARTED_ACPD_PID" 2>/dev/null || break
+    sleep 0.25
+  done
+  echo "devin-acpd failed to start at $ACPD_SOCK — see $ACPD_LOG" >&2
+  cleanup_created "$STARTED_ACPD_PID" "$ACPD_PIDFILE"
+  return 1
+}
+
+acpd_stop() {
+  if ! pid_alive "$ACPD_PIDFILE"; then
+    rm -f "$ACPD_PIDFILE" "$ACPD_SOCK" "$HOST_SOCK"
+    echo "devin-acpd not running"
+    return 0
+  fi
+  local pid
+  pid="$(cat "$ACPD_PIDFILE")"
+  stop_tree "$ACPD_PIDFILE"   # group kill takes the `devin acp` child too
+  rm -f "$ACPD_SOCK" "$HOST_SOCK"
+  echo "devin-acpd stopped (was pid $pid)"
+}
+
+acpd_status() {
+  if pid_alive "$ACPD_PIDFILE"; then
+    echo "devin-acpd running (pid $(cat "$ACPD_PIDFILE"), socks $ACPD_SOCK + $HOST_SOCK)"
+  else
+    echo "devin-acpd not running"
+  fi
+  if pid_alive "$ACPD_IDLE_PIDFILE"; then
+    echo "idle-restart watcher armed (pid $(cat "$ACPD_IDLE_PIDFILE")) — fires at next all-idle gap"
+  fi
+}
+
+# web reports running sessions; an unreachable web means we can't verify
+# idle — treat as busy (fail safe) and require --force/--when-idle
+sessions_busy() {
+  local body
+  body="$(curl -sf --max-time 3 "$URL/api/sessions" 2>/dev/null)" || return 0
+  grep -q '"running":true' <<<"$body"
+}
+
+acpd_restart_when_idle() {
+  if pid_alive "$ACPD_IDLE_PIDFILE"; then
+    echo "idle-restart watcher already armed (pid $(cat "$ACPD_IDLE_PIDFILE"))"
+    return 0
+  fi
+  ensure_state
+  rm -f "$ACPD_IDLE_PIDFILE"
+  # detached — the asking session's own turn may be the busy one; when the
+  # restart lands that turn dies, and so would an inline waiter
+  setsid nohup env "DEVIN_WEB_PORT=$PORT" "DEVIN_WEB_STATE_DIR=$STATE" \
+    "DEVIN_WEB_ACP_SOCK=$ACPD_SOCK" \
+    node "$ROOT/bin/devin-web-idle-restart.mjs" >>"$ACPD_WATCH_LOG" 2>&1 &
+  echo "idle-restart watcher armed — 'acpd restart' fires once all sessions are idle (log: $ACPD_WATCH_LOG)"
+}
+
+acpd_restart() {
+  preflight || return 1
+  case "${1:-}" in
+    --when-idle) acpd_restart_when_idle; return ;;
+    --force) ;;
+    "")
+      if sessions_busy; then
+        echo "refusing: sessions are busy — a restart kills the agent and their turns" >&2
+        echo "  $0 acpd restart --when-idle   restart at the next idle gap" >&2
+        echo "  $0 acpd restart --force       kill in-flight turns now" >&2
+        return 1
+      fi
+      ;;
+    *) echo "usage: $0 acpd restart [--when-idle|--force]" >&2; return 2 ;;
+  esac
+  acpd_stop || true
+  acpd_start
+}
+
+# ---------------- devin-web ----------------
+
+start() {
+  preflight || return 1
+  if pid_alive "$PIDFILE"; then
+    rm -f "$DISABLED"
+    watch_start
+    echo "already running (pid $(cat "$PIDFILE")) → $URL"
+    return 0
+  fi
+  # Bind-only check: no HTTP request/socket probe can attach to an unrelated
+  # service. The wrapper checks again immediately before spawning Next.
+  preflight --check-port || return 1
+  ensure_state
+  if [[ -f $LOG ]] && [[ $(stat -c%s "$LOG" 2>/dev/null || stat -f%z "$LOG") -gt 5242880 ]]; then
+    mv "$LOG" "$LOG.1"
+  fi
+  local env_args=(env "DEVIN_WEB_STATE_DIR=$STATE" "DEVIN_WEB_ACP_FALLBACK=0")
+  local started_acpd="" started_web
+  if [[ $ACPD_ENABLED != 0 ]]; then
+    if ! acpd_start >/dev/null; then
+      echo "error: devin-acpd failed to start — see $ACPD_LOG" >&2
+      return 1
+    fi
+    started_acpd="$STARTED_ACPD_PID"
+    env_args+=("DEVIN_WEB_ACP_SOCK=$ACPD_SOCK" "DEVIN_WEB_HOST_SOCK=$HOST_SOCK")
+    echo "using devin-acpd at $ACPD_SOCK"
+  else
+    echo "devin-acpd disabled (DEVIN_WEB_ACPD=0) — in-process acp mode"
+  fi
+  rm -f "$PIDFILE"
+  setsid nohup "${env_args[@]}" node "$ROOT/bin/devin-web.mjs" --port "$PORT" --no-open >>"$LOG" 2>&1 &
+  started_web=$!
+  for _ in $(seq 1 30); do
+    if ! kill -0 "$started_web" 2>/dev/null; then break; fi
+    # Only consider readiness after this launch has published its pidfile.
+    if [[ -f $PIDFILE && $(cat "$PIDFILE") == "$started_web" ]] && curl -sf -o /dev/null --max-time 1 "$URL/"; then
+      rm -f "$DISABLED"
+      watch_start
+      echo "devin-web up (pid $(cat "$PIDFILE")) → $URL"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "devin-web failed to start at $URL — see $LOG" >&2
+  cleanup_created "$started_web" "$PIDFILE"
+  cleanup_created "$started_acpd" "$ACPD_PIDFILE"
+  return 1
+}
+
+stop() {
+  if ! pid_alive "$PIDFILE"; then
+    rm -f "$PIDFILE"
+    local owner
+    owner="$(port_owner || true)"
+    if [[ -n $owner ]]; then
+      echo "not running via pidfile, but port $PORT is held by pid $owner — orphan?" >&2
+      echo "  kill it with:  kill $owner" >&2
+      return 1
+    fi
+    echo "not running"
+    return 0
+  fi
+  local pid
+  pid="$(cat "$PIDFILE")"
+  stop_tree "$PIDFILE"
+  if [[ $ACPD_ENABLED != 0 ]]; then
+    echo "stopped web (was pid $pid) — devin-acpd and the agent keep running"
+  else
+    echo "stopped (was pid $pid)"
+  fi
+}
+
+status() {
+  acpd_status
+  if pid_alive "$WATCH_PIDFILE"; then
+    echo "devin-web-watch running (pid $(cat "$WATCH_PIDFILE"))"
+  elif [[ -f $DISABLED ]]; then
+    echo "devin-web-watch not running (supervision disabled — web stopped intentionally)"
+  else
+    echo "devin-web-watch not running — start the web to arm it"
+  fi
+  if pid_alive "$PIDFILE"; then
+    echo "devin-web running (pid $(cat "$PIDFILE"))"
+    curl -sf -o /dev/null --max-time 2 "$URL/" && echo "  $URL → OK" || echo "  $URL → not answering (see $LOG)"
+  else
+    echo "devin-web not running"
+    local owner
+    owner="$(port_owner || true)"
+    [[ -n $owner ]] && echo "  warning: port $PORT held by pid $owner (orphan)" >&2
+  fi
+}
+
+logs() {
+  local file="$LOG"
+  [[ ${1:-} == acpd ]] && { file="$ACPD_LOG"; shift; }
+  case "${1:-}" in
+    -f|--follow) exec tail -f "$file" ;;
+    "") tail -n 100 "$file" ;;
+    *) tail -n "$1" "$file" ;;
+  esac
+}
+
+open_url() {
+  local host
+  host="$(tailscale status --json 2>/dev/null | grep -oP '"DNSName": "\K[^".]+' | head -1)"
+  local target="${host:+https://${host%.}:$PORT}"
+  target="${target:-$URL}"
+  echo "$target"
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$target" >/dev/null 2>&1 &
+  elif command -v open >/dev/null 2>&1; then
+    open "$target"
+  fi
+}
+
+case "${1:-}" in
+  -h|--help) echo "usage: $0 {start|stop [--all]|restart|restart-all|acpd {start|stop|status|restart [--when-idle|--force]}|status|logs [acpd] [-f]|search-compact|worktrees [rm <slug>]|open}" ;;
+  start) start ;;
+  stop)
+    # an intentional stop stays down — mark it before anything dies so a
+    # nested caller's detached re-drive still lands on the same marker
+    ensure_state
+    : >"$DISABLED"
+    watch_stop
+    if [[ ${2:-} == --all ]]; then
+      redrive_if_nested stop --all || { stop || true; acpd_stop; }
+    else
+      redrive_if_nested stop || { stop || true; }
+    fi
+    ;;
+  restart) restart_preflight; redrive_if_nested restart || { stop || true; start; } ;;   # web only — the daemon must not bounce
+  restart-all) restart_preflight; redrive_if_nested restart-all || { stop || true; acpd_stop || true; start; } ;;
+  acpd)
+    case "${2:-}" in
+      start) acpd_start ;;
+      stop) acpd_stop ;;
+      status) acpd_status ;;
+      restart) acpd_restart "${3:-}" ;;
+      *) echo "usage: $0 acpd {start|stop|status|restart [--when-idle|--force]}" >&2; exit 2 ;;
+    esac
+    ;;
+  status) status ;;
+  logs) shift; logs "$@" ;;
+  search-compact)
+    # rebuild the fts postings + VACUUM search.db via the running server
+    # (the fts handle lives in that process); falls back to a delete hint
+    curl -fsS -X POST -H "x-devin-web: 1" "$URL/api/search/compact" &&
+      echo " — search.db compacted" ||
+      echo "server unreachable — rm -f $STATE/search.db* also works (rebuilds on next search)" >&2
+    ;;
+  open) open_url ;;
+  worktrees)
+    # list recorded worktree sessions (+ dirty state), or remove one.
+    # `rm` runs `git worktree remove` — a dirty tree fails and the error is
+    # shown verbatim (uncommitted work is never auto-discarded).
+    WJ="$STATE/worktrees.json"
+    if [[ ${2:-} == rm ]]; then
+      name="${3:?usage: $0 worktrees rm <slug-or-path>}"
+      [[ -f $WJ ]] || { echo "no worktrees.json"; exit 1; }
+      entry="$(python3 - "$WJ" "$name" <<'PY'
+import json,sys
+recs = json.load(open(sys.argv[1]))
+want = sys.argv[2]
+for path, r in recs.items():
+    if path == want or path.endswith("/" + want):
+        print(f"{path}\t{r['repo']}\t{r['branch']}")
+        break
+PY
+)"
+      [[ -n $entry ]] || { echo "no recorded worktree: $name" >&2; exit 1; }
+      wpath="$(cut -f1 <<<"$entry")"; wrepo="$(cut -f2 <<<"$entry")"; wbranch="$(cut -f3 <<<"$entry")"
+      git -C "$wrepo" worktree remove "$wpath" || exit 1
+      python3 - "$WJ" "$wpath" <<'PY'
+import json,sys
+f=sys.argv[1]; recs=json.load(open(f)); recs.pop(sys.argv[2],None)
+import os,tempfile
+fd,t=tempfile.mkstemp(dir=os.path.dirname(f)); os.write(fd,(json.dumps(recs)+"\n").encode()); os.fchmod(fd,0o600); os.close(fd); os.rename(t,f)
+PY
+      echo "removed $wpath"
+      echo "note: branch kept (may hold commits) — delete with: git -C $wrepo branch -D $wbranch"
+    else
+      [[ -f $WJ ]] || { echo "(none — $WJ not found)"; exit 0; }
+      python3 - "$WJ" <<'PY'
+import json,os,subprocess,sys
+recs = json.load(open(sys.argv[1]))
+if not recs: print("(none)"); sys.exit(0)
+for path, r in sorted(recs.items(), key=lambda kv: kv[1].get("createdAt","")):
+    if not os.path.exists(path):
+        st = "MISSING"
+    else:
+        d = subprocess.run(["git","-C",path,"status","--porcelain"],capture_output=True,text=True)
+        st = "dirty" if d.stdout.strip() else "clean"
+    sess = r.get("sessionId") or "-"
+    print(f"{path.rsplit('/',1)[-1]:40} {st:8} {r.get('branch','?'):50} session={sess}  repo={r.get('repo','?')}")
+    print(f"    path: {path}")
+PY
+      echo "remove: $0 worktrees rm <slug>"
+    fi
+    ;;
+  *) echo "usage: $0 {start|stop [--all]|restart|restart-all|acpd {start|stop|status|restart [--when-idle|--force]}|status|logs [acpd] [-f]|search-compact|worktrees [rm <slug>]|open}   (log: $LOG)" >&2; exit 2 ;;
+esac

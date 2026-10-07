@@ -1,0 +1,96 @@
+name: Release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main' && !github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - name: Require real CLI acceptance for this exact commit
+        env:
+          ACCEPTED: ${{ vars.REAL_CLI_ACCEPTED_SHA }}
+          CANDIDATE: ${{ github.sha }}
+        run: test "$ACCEPTED" = "$CANDIDATE"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typegen && pnpm verify && pnpm docs:check && pnpm public:check
+      - run: node bin/check-audit.mjs && bash bin/scan-secrets.sh
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:e2e && pnpm test:daemon
+      - name: Package the verified commit
+        id: version
+        env:
+          CANDIDATE: ${{ github.sha }}
+        run: |
+          node bin/pack-release.mjs "$CANDIDATE"
+          node bin/archive-smoke.mjs "release/$(jq -r .source release/manifest.json)"
+          echo "version=$(jq -r .version release/manifest.json)" >> "$GITHUB_OUTPUT"
+          echo "sha=$CANDIDATE" >> "$GITHUB_OUTPUT"
+          version="$(jq -r .version release/manifest.json)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test -f "docs/releases/$version.md"
+          cp "docs/releases/$version.md" release/RELEASE_NOTES.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-source
+          path: release/
+          retention-days: 7
+          if-no-files-found: error
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      checks: read
+    steps:
+      # Deliberately no checkout, package install or project code in the write job.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-source
+          path: release
+      - name: Verify identity and publish once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CANDIDATE: ${{ needs.verify.outputs.sha }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(gh api "repos/$GH_REPO/commits/main" --jq .sha)" = "$CANDIDATE"
+          test "$(jq -r .commit release/manifest.json)" = "$CANDIDATE"
+          test "$(jq -r .version release/manifest.json)" = "$VERSION"
+          test "$(jq -r .source release/manifest.json)" = "devin-web-$VERSION.tar.gz"
+          (cd release && sha256sum --check SHA256SUMS)
+          gh api "repos/$GH_REPO/commits/$CANDIDATE/check-runs" --paginate --jq '.check_runs[] | [.name,.conclusion] | @tsv' > checks.tsv
+          grep -Fx $'CI Gate\tsuccess' checks.tsv
+          grep -E '^CodeQL.*\ssuccess$' checks.tsv
+          # A matching pre-existing tag or release is a hard failure.
+          if gh api "repos/$GH_REPO/git/ref/tags/v$VERSION" >/dev/null 2>&1; then exit 1; fi
+          if gh release view "v$VERSION" >/dev/null 2>&1; then exit 1; fi
+          gh api "repos/$GH_REPO/git/refs" -f ref="refs/tags/v$VERSION" -f sha="$CANDIDATE"
+          gh release create "v$VERSION" --verify-tag --draft --title "devin-web v$VERSION" --notes-file release/RELEASE_NOTES.md "release/devin-web-$VERSION.tar.gz" release/SHA256SUMS release/manifest.json
+          test "$(gh api "repos/$GH_REPO/commits/main" --jq .sha)" = "$CANDIDATE"
+          gh release edit "v$VERSION" --draft=false

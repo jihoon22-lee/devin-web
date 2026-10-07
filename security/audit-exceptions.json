@@ -1,0 +1,11 @@
+[
+  {
+    "advisory": "GHSA-vfj7-8cjw-p6xm",
+    "module": "braces",
+    "version": "3.0.3",
+    "pathPrefix": ". > eslint-config-next@",
+    "expires": "2026-11-06",
+    "reason": "Development-only Next ESLint glob expansion, absent from the production dependency tree. Patterns come from repository-controlled lint configuration, not HTTP or agent input. Public PR lint runs without secrets on disposable hosted runners and has a timeout. No patched upstream release exists as of 2026-10-07. Review monthly and remove when fixed.",
+    "source": "https://github.com/advisories/GHSA-vfj7-8cjw-p6xm"
+  }
+]

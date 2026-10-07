@@ -1,0 +1,321 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-bg: #090b11;
+  --color-panel: #0d1017;
+  --color-panel2: #131824;
+  --color-panel3: #1a2130;
+  --color-border: #1e2635;
+  --color-border2: #2a3547;
+  --color-text: #dbe1ec;
+  --color-dim: #8b94a7;
+  --color-faint: #788195; /* ≥4.5:1 on bg/panel — WCAG AA for small text */
+  --color-accent: #7aa2f7;
+  --color-violet: #bb9af7;
+  --color-green: #9ece6a;
+  --color-red: #f7768e;
+  --color-yellow: #e0af68;
+
+  /* semantic statuses — one meaning per hue (amber used to double as
+     folder icons, locks, "needs input" and generic warnings) */
+  --color-status-running: var(--color-accent);
+  --color-status-input: var(--color-yellow);   /* needs the user's answer */
+  --color-status-locked: var(--color-violet);
+  --color-success: var(--color-green);
+  --color-danger: var(--color-red);
+  --color-warning: var(--color-yellow);        /* caution, not a request */
+  --color-folder: #93a0bb;
+
+  /* surfaces that used to carry raw hexes */
+  --color-code-bg: #0a0d13;
+  --color-scrim: rgb(0 0 0 / 60%); /* modal/sidebar backdrop */
+  --color-term: #0b0e14;           /* xterm canvas — TerminalPanel reads this */
+  --color-scrollbar-thumb: #232b3a;
+  --color-scrollbar-thumb-hover: #2e3a4f;
+  --color-toast-info-bg: #101724;
+  --color-toast-info-text: #c8d8f8;
+  --color-toast-danger-bg: #1c1117;
+  --color-toast-danger-text: #f2c4cf;
+
+  /* small-text scale — rem-based so the browser font-size setting wins;
+     badges/counters floor at tiny, labels at 2xs (≈10px/11px at default) */
+  --text-tiny: 0.69rem;
+  --text-2xs: 0.76rem;
+}
+
+/* Light theme — same token names, so every var()-based utility follows.
+   Tailwind's text-white/text-black read --color-white/--color-black: in
+   this codebase "white" means "strongest text" and "black" means "text on
+   an accent fill", so they flip too. The xterm canvas (--color-term) stays
+   dark: terminal programs assume a dark background. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --color-bg: #f5f6fa;
+  --color-panel: #ffffff;
+  --color-panel2: #eff2f7;
+  --color-panel3: #e3e8f0;
+  --color-border: #dce2ec;
+  --color-border2: #c6cfdd;
+  --color-text: #1a2130;
+  --color-dim: #4b566a;
+  --color-faint: #5b6679; /* ≥4.5:1 on white/bg */
+  --color-accent: #2c5bd0;
+  --color-violet: #7444c9;
+  --color-green: #2b7a30;
+  --color-red: #c42a46;
+  --color-yellow: #946000;
+  --color-folder: #5a6884;
+  --color-code-bg: #f3f5f9;
+  --color-scrim: rgb(20 26 38 / 40%);
+  --color-scrollbar-thumb: #c6cfdd;
+  --color-scrollbar-thumb-hover: #aeb9cb;
+  --color-toast-info-bg: #eaf0ff;
+  --color-toast-info-text: #1d3a8a;
+  --color-toast-danger-bg: #fdebef;
+  --color-toast-danger-text: #8a1a32;
+  --color-white: #0d1320;
+  --color-black: #ffffff;
+}
+:root:not([data-theme="light"]) {
+  color-scheme: dark;
+}
+
+/* shiki renders both palettes as CSS variables (Markdown.tsx); pick one */
+.shiki,
+.shiki span {
+  color: var(--shiki-dark);
+  background-color: var(--shiki-dark-bg);
+}
+:root[data-theme="light"] .shiki,
+:root[data-theme="light"] .shiki span {
+  color: var(--shiki-light);
+  background-color: var(--shiki-light-bg);
+}
+.shiki-wrap .shiki {
+  background-color: transparent !important;
+}
+
+/* phones: the 10–11px meta scale is too small to read at arm's length */
+@media (max-width: 767px) {
+  .text-tiny {
+    font-size: 0.78rem;
+  }
+  .text-2xs {
+    font-size: 0.84rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+html {
+  /* 90.625% of the user's font size ≈ 14.5px at the 16px default —
+     percentage so browser-level font scaling still applies */
+  font-size: 90.625%;
+}
+
+html,
+body {
+  height: 100%;
+  height: 100dvh; /* tracks mobile keyboard/address-bar */
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans, ui-sans-serif), system-ui, -apple-system, "Segoe UI",
+    "Pretendard", "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 32%, transparent);
+}
+
+button,
+a,
+select {
+  touch-action: manipulation; /* kill 300ms tap delay / dbl-tap zoom */
+}
+
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-accent) 55%, transparent);
+  outline-offset: -1px;
+  border-radius: 6px;
+}
+
+.mono {
+  font-family: var(--font-mono, ui-monospace), "SF Mono", Menlo, Consolas, monospace;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-scrollbar-thumb);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-scrollbar-thumb-hover);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---- markdown ---- */
+.md {
+  /* Korean (and other script) user/agent text wraps on words, not mid-syllable */
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+.md p {
+  margin: 0.45em 0;
+}
+.md ul,
+.md ol {
+  padding-left: 1.4em;
+  margin: 0.45em 0;
+}
+.md li {
+  margin: 0.18em 0;
+}
+.md li::marker {
+  color: var(--color-faint);
+}
+.md ul {
+  list-style: disc;
+}
+.md ol {
+  list-style: decimal;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4 {
+  font-weight: 600;
+  margin: 0.9em 0 0.4em;
+  letter-spacing: -0.01em;
+}
+.md h1 {
+  font-size: 1.3em;
+}
+.md h2 {
+  font-size: 1.15em;
+}
+.md h3 {
+  font-size: 1.05em;
+}
+.md code {
+  font-family: var(--font-mono, ui-monospace), "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.88em;
+}
+.md p code,
+.md li code,
+.md td code,
+.md h1 code,
+.md h2 code,
+.md h3 code {
+  background: var(--color-panel3);
+  padding: 0.12em 0.4em;
+  border-radius: 5px;
+  border: 1px solid var(--color-scrollbar-thumb);
+}
+.md table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+}
+.md th,
+.md td {
+  border: 1px solid var(--color-border);
+  padding: 0.35em 0.75em;
+  font-size: 0.9em;
+}
+.md th {
+  background: var(--color-panel2);
+}
+.md blockquote {
+  border-left: 3px solid var(--color-border2);
+  padding-left: 0.9em;
+  color: var(--color-dim);
+  margin: 0.5em 0;
+}
+.md a {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--color-border);
+  margin: 1em 0;
+}
+
+/* fenced code block — wrapper div emitted by components/Markdown */
+.codeblock {
+  margin: 0.55em 0;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--color-code-bg);
+}
+.codeblock-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.3em 0.8em;
+  background: var(--color-panel2);
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-faint);
+  font-size: 0.75em;
+}
+.codeblock pre {
+  margin: 0;
+  padding: 0.7em 0.9em;
+  overflow-x: auto;
+  font-size: 0.86em;
+  line-height: 1.55;
+}
+.md pre {
+  background: var(--color-code-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 0.7em 0.9em;
+  overflow-x: auto;
+  font-size: 0.86em;
+}
+
+/* cheap virtualization — skip rendering off-screen messages */
+.dw-virt {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 90px;
+}
+
+/* xterm container */
+.xterm-container .xterm {
+  padding: 8px;
+}
+
+/* subtle entrance for toasts/menus */
+@keyframes dw-pop {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.dw-pop {
+  animation: dw-pop 0.12s ease-out;
+}

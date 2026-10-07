@@ -1,0 +1,66 @@
+{
+  "name": "devin-web",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "devin-web": "bin/devin-web.mjs"
+  },
+  "scripts": {
+    "dev": "node bin/devin-web.mjs --dev",
+    "build": "next build",
+    "start": "node bin/devin-web.mjs --no-open",
+    "lint": "eslint",
+    "test": "NODE_ENV=development vitest run",
+    "verify": "tsc --noEmit && tsc -p tsconfig.daemon.json && NODE_ENV=development vitest run && eslint",
+    "check": "pnpm verify && next build",
+    "svc": "bin/devin-web-ctl",
+    "prepare": "node bin/install-hooks.mjs",
+    "typegen": "next typegen",
+    "docs:check": "node bin/check-docs.mjs",
+    "public:check": "node bin/check-public.mjs",
+    "test:e2e": "playwright test",
+    "test:daemon": "playwright test -c e2e/daemon/playwright.config.ts"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "lucide-react": "^1.46.0",
+    "next": "16.3.6",
+    "node-pty": "^1.1.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "shiki": "^4.4.3",
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@tailwindcss/postcss": "^4.3.3",
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^22.20.4",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/web-push": "^3.6.4",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "16.3.6",
+    "jsdom": "^30.0.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.1"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=24.18.0 <25"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jihoon22-lee/devin-web.git"
+  },
+  "homepage": "https://github.com/jihoon22-lee/devin-web#readme",
+  "bugs": {
+    "url": "https://github.com/jihoon22-lee/devin-web/issues"
+  }
+}
