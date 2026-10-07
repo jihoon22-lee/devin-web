@@ -157,6 +157,16 @@ export async function changePaths(cwd: string, file: string): Promise<string[]> 
 }
 
 export class RevertConflictError extends Error {}
+
+/** Include both sides of any rename touching the captured paths, but ignore
+ * independent changes elsewhere in the repository. */
+function scopedStatus(status: string, paths: string[]): string {
+  const selected = new Set(paths);
+  return JSON.stringify(parsePorcelainZ(status)
+    .filter((entry) => selected.has(entry.path) || (entry.originalPath !== undefined && selected.has(entry.originalPath)))
+    .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+}
+
 export interface RevertPlan {
   root: string;
   file: string;
@@ -171,7 +181,7 @@ export async function prepareRevert(cwd: string, file: string): Promise<RevertPl
   const status = await git(root, ["status", "--porcelain=v1", "-z", "-uall"]);
   const paths = pathsFromStatus(status, file);
   const index = await git(root, ["ls-files", "--stage", "-z", "--", ...paths]);
-  return { root, file, paths, status, index, untracked: parsePorcelainZ(status).find((f) => f.path === file)?.status === "??" };
+  return { root, file, paths, status: scopedStatus(status, paths), index, untracked: parsePorcelainZ(status).find((f) => f.path === file)?.status === "??" };
 }
 
 /** Discard only the paths captured before the safety copy. Validate status,
@@ -183,7 +193,7 @@ export async function revertFile(cwd: string, file: string, prepared?: RevertPla
     git(plan.root, ["status", "--porcelain=v1", "-z", "-uall"]),
     git(plan.root, ["ls-files", "--stage", "-z", "--", ...plan.paths]),
   ]);
-  if (status !== plan.status || index !== plan.index) {
+  if (scopedStatus(status, plan.paths) !== plan.status || index !== plan.index) {
     throw new RevertConflictError("Changes changed since the safety copy; refresh and try again. Nothing was discarded.");
   }
   beforeDiscard?.();

@@ -134,3 +134,43 @@ it("rejects same-status worktree edits made after the safety copy", async () => 
   expect(result.status).toBe(409);
   expect(readFileSync(join(cwd, "file.txt"), "utf8")).toBe("newer edit");
 });
+
+it.each(["add", "modify"])("allows unrelated file %s while discarding the selected file", async (change) => {
+  const cwd = join(dir, `unrelated-${change}`);
+  mkdirSync(cwd); control.cwd = cwd;
+  const g = (...args: string[]) => execFileSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...args]);
+  g("init", "-q");
+  writeFileSync(join(cwd, "selected.txt"), "base");
+  if (change === "modify") writeFileSync(join(cwd, "other.txt"), "other base");
+  g("add", "."); g("commit", "-qm", "base");
+  writeFileSync(join(cwd, "selected.txt"), "selected edit");
+  control.afterBackup = () => writeFileSync(join(cwd, "other.txt"), "independent work");
+  const result = await POST(new Request("http://localhost/api/sessions/s/changes", {
+    method: "POST", body: JSON.stringify({ action: "revert", file: "selected.txt" }),
+  }), { params: Promise.resolve({ id: "s" }) });
+  expect(result.status).toBe(200);
+  expect(readFileSync(join(cwd, "selected.txt"), "utf8")).toBe("base");
+  expect(readFileSync(join(cwd, "other.txt"), "utf8")).toBe("independent work");
+});
+
+it("rejects an index-only change even when porcelain status and worktree bytes match", async () => {
+  const cwd = join(dir, "index-only-change");
+  mkdirSync(cwd); control.cwd = cwd;
+  const g = (...args: string[]) => execFileSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...args]);
+  g("init", "-q"); writeFileSync(join(cwd, "file.txt"), "base");
+  g("add", "."); g("commit", "-qm", "base");
+  writeFileSync(join(cwd, "file.txt"), "old index"); g("add", "file.txt");
+  writeFileSync(join(cwd, "file.txt"), "worktree edit");
+  const status = g("status", "--porcelain=v1").toString();
+  control.afterBackup = () => {
+    writeFileSync(join(cwd, "file.txt"), "new index"); g("add", "file.txt");
+    writeFileSync(join(cwd, "file.txt"), "worktree edit");
+    expect(g("status", "--porcelain=v1").toString()).toBe(status);
+  };
+  const result = await POST(new Request("http://localhost/api/sessions/s/changes", {
+    method: "POST", body: JSON.stringify({ action: "revert", file: "file.txt" }),
+  }), { params: Promise.resolve({ id: "s" }) });
+  expect(result.status).toBe(409);
+  expect(readFileSync(join(cwd, "file.txt"), "utf8")).toBe("worktree edit");
+  expect(g("show", ":file.txt").toString()).toBe("new index");
+});
