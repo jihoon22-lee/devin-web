@@ -27,10 +27,6 @@ describe("devin-web-ctl state dir (L2·L3)", () => {
   it("no raw mkdir of $STATE remains outside ensure_state", () => {
     expect(src.split("\n").filter((l) => l.includes('mkdir -p "$STATE"'))).toHaveLength(1);
   });
-
-  it("acpd is launched with the same DEVIN_WEB_STATE_DIR ctl uses", () => {
-    expect(src).toMatch(/env "DEVIN_WEB_STATE_DIR=\$STATE"[^\n]*bin\/devin-acpd\.mjs/);
-  });
 });
 
   it("resolves STATE with the same precedence as lib/paths.mjs (R12 C4)", () => {

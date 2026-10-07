@@ -46,23 +46,30 @@ fi
 
 preflight() { node "$ROOT/bin/runtime.mjs" "$@"; }
 
-# Only use this with a PID captured by this invocation's own launch. Existing
-# daemon and watch processes are never candidates for failed-start cleanup.
-cleanup_created() {
-  local pid="$1" file="$2"
-  [[ -n $pid ]] || return 0
-  kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-  for _ in $(seq 1 20); do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.1
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -9 -- -"$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
-  fi
-  if [[ -f $file && $(cat "$file") == "$pid" ]]; then rm -f "$file"; fi
+# Each PID is paired with a process-start/configuration identity. Legacy or
+# mismatched live PIDs fail closed until explicitly verified and adopted.
+role_for() {
+  case "$1" in
+    "$PIDFILE") echo web ;; "$ACPD_PIDFILE") echo acpd ;;
+    "$WATCH_PIDFILE") echo watch ;; "$ACPD_IDLE_PIDFILE") echo idle ;;
+    *) return 1 ;;
+  esac
 }
-
-pid_alive() { [[ -f $1 ]] && kill -0 "$(cat "$1")" 2>/dev/null; }
+identity() { node "$ROOT/bin/process-identity.mjs" "$1" "$2" "$(role_for "$2")"; }
+pid_alive() { identity alive "$1"; }
+guard_identity() { identity guard "$1"; }
+cleanup_created() {
+  local file="$1" token="$2"
+  [[ -n $token ]] || return 0
+  node "$ROOT/bin/process-identity.mjs" cleanup "$file" "$(role_for "$file")" "$token"
+}
+new_launch_id() { node "$ROOT/bin/process-identity.mjs" token; }
+guard_managed() {
+  guard_identity "$PIDFILE" || return 1
+  guard_identity "$WATCH_PIDFILE" || return 1
+  guard_identity "$ACPD_IDLE_PIDFILE" || return 1
+  if [[ $ACPD_ENABLED != 0 ]]; then guard_identity "$ACPD_PIDFILE" || return 1; fi
+}
 
 # The state dir holds the agent/terminal sockets, pidfiles, tags and the
 # search cache — owner-only. `mkdir -p` alone keeps whatever mode an older
@@ -79,6 +86,7 @@ port_owners() {
 port_owner() { port_owners | head -1; }
 
 restart_preflight() {
+  guard_managed || return 1
   preflight || return 1
   # A free target is safe. An occupied target is safe only when every listener
   # belongs to the current managed wrapper's process tree, which stop replaces.
@@ -104,33 +112,25 @@ restart_preflight() {
   done
 }
 
-stop_tree() { # $1=pidfile — kill the whole process group, then the pid
-  local pid
-  pid="$(cat "$1")"
-  kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-  for _ in $(seq 1 20); do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.25
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -9 -- -"$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
-  fi
-  rm -f "$1"
-}
+stop_tree() { identity stop "$1"; }
 
 # ---------------- web watchdog ----------------
 # devin-web-watch resurrects the server when it dies unattended (crash,
 # OOM, a nested restart that never reached `start`). An explicit `stop`
 # drops $DISABLED first — supervision must never undo an intentional stop.
 watch_start() {
+  guard_identity "$WATCH_PIDFILE" || return 1
   pid_alive "$WATCH_PIDFILE" && return 0
   ensure_state
   rm -f "$WATCH_PIDFILE"
-  setsid nohup env "DEVIN_WEB_PORT=$PORT" "DEVIN_WEB_STATE_DIR=$STATE" \
-    node "$ROOT/bin/devin-web-watch.mjs" >>"$WATCH_LOG" 2>&1 &
+  local launch_id
+  launch_id="$(new_launch_id)"
+  setsid nohup env "DEVIN_WEB_LAUNCH_ID=$launch_id" "DEVIN_WEB_PORT=$PORT" "DEVIN_WEB_STATE_DIR=$STATE" \
+    node "$ROOT/bin/process-identity.mjs" launch "$WATCH_PIDFILE" watch >>"$WATCH_LOG" 2>&1 9>&- &
 }
 
 watch_stop() {
+  guard_identity "$WATCH_PIDFILE" || return 1
   if pid_alive "$WATCH_PIDFILE"; then stop_tree "$WATCH_PIDFILE"; else rm -f "$WATCH_PIDFILE"; fi
 }
 
@@ -156,7 +156,7 @@ redrive_if_nested() {
   [[ -n ${DEVIN_WEB_DETACHED:-} ]] && return 1 # already the detached copy
   web_ancestor || return 1                     # outside the web tree — run inline
   echo "called from inside the devin-web process tree — re-driving detached (see $LOG)" >&2
-  setsid env DEVIN_WEB_DETACHED=1 "$ROOT/bin/devin-web-ctl" "$@" </dev/null >>"$LOG" 2>&1 &
+  setsid env DEVIN_WEB_DETACHED=1 "$ROOT/bin/devin-web-ctl" "$@" </dev/null >>"$LOG" 2>&1 9>&- &
 }
 
 # ---------------- devin-acpd ----------------
@@ -174,7 +174,9 @@ orphan_acp_pids() {
 }
 
 acpd_start() {
+  guard_identity "$ACPD_PIDFILE" || return 1
   STARTED_ACPD_PID=""
+  STARTED_ACPD_LAUNCH_ID=""
   if pid_alive "$ACPD_PIDFILE"; then
     echo "devin-acpd already running (pid $(cat "$ACPD_PIDFILE"))"
     return 0
@@ -198,7 +200,8 @@ acpd_start() {
   if [[ -f $ACPD_LOG ]] && [[ $(stat -c%s "$ACPD_LOG" 2>/dev/null || stat -f%z "$ACPD_LOG") -gt 5242880 ]]; then
     mv "$ACPD_LOG" "$ACPD_LOG.1"
   fi
-  setsid nohup env "DEVIN_WEB_STATE_DIR=$STATE" "DEVIN_WEB_ACP_SOCK=$ACPD_SOCK" "DEVIN_WEB_HOST_SOCK=$HOST_SOCK" node "$ROOT/bin/devin-acpd.mjs" >>"$ACPD_LOG" 2>&1 &
+  STARTED_ACPD_LAUNCH_ID="$(new_launch_id)"
+  setsid nohup env "DEVIN_WEB_LAUNCH_ID=$STARTED_ACPD_LAUNCH_ID" "DEVIN_WEB_STATE_DIR=$STATE" "DEVIN_WEB_ACP_SOCK=$ACPD_SOCK" "DEVIN_WEB_HOST_SOCK=$HOST_SOCK" node "$ROOT/bin/process-identity.mjs" launch "$ACPD_PIDFILE" acpd >>"$ACPD_LOG" 2>&1 9>&- &
   STARTED_ACPD_PID=$!
   # the daemon writes its own pidfile — $! here can be a short-lived wrapper
   for _ in $(seq 1 40); do
@@ -210,11 +213,12 @@ acpd_start() {
     sleep 0.25
   done
   echo "devin-acpd failed to start at $ACPD_SOCK — see $ACPD_LOG" >&2
-  cleanup_created "$STARTED_ACPD_PID" "$ACPD_PIDFILE"
+  cleanup_created "$ACPD_PIDFILE" "$STARTED_ACPD_LAUNCH_ID"
   return 1
 }
 
 acpd_stop() {
+  guard_identity "$ACPD_PIDFILE" || return 1
   if ! pid_alive "$ACPD_PIDFILE"; then
     rm -f "$ACPD_PIDFILE" "$ACPD_SOCK" "$HOST_SOCK"
     echo "devin-acpd not running"
@@ -222,12 +226,14 @@ acpd_stop() {
   fi
   local pid
   pid="$(cat "$ACPD_PIDFILE")"
-  stop_tree "$ACPD_PIDFILE"   # group kill takes the `devin acp` child too
+  stop_tree "$ACPD_PIDFILE" || return 1   # group kill takes the `devin acp` child too
   rm -f "$ACPD_SOCK" "$HOST_SOCK"
   echo "devin-acpd stopped (was pid $pid)"
 }
 
 acpd_status() {
+  guard_identity "$ACPD_PIDFILE" || return 1
+  guard_identity "$ACPD_IDLE_PIDFILE" || return 1
   if pid_alive "$ACPD_PIDFILE"; then
     echo "devin-acpd running (pid $(cat "$ACPD_PIDFILE"), socks $ACPD_SOCK + $HOST_SOCK)"
   else
@@ -247,6 +253,8 @@ sessions_busy() {
 }
 
 acpd_restart_when_idle() {
+  guard_identity "$ACPD_IDLE_PIDFILE" || return 1
+  guard_identity "$ACPD_PIDFILE" || return 1
   if pid_alive "$ACPD_IDLE_PIDFILE"; then
     echo "idle-restart watcher already armed (pid $(cat "$ACPD_IDLE_PIDFILE"))"
     return 0
@@ -255,13 +263,16 @@ acpd_restart_when_idle() {
   rm -f "$ACPD_IDLE_PIDFILE"
   # detached — the asking session's own turn may be the busy one; when the
   # restart lands that turn dies, and so would an inline waiter
-  setsid nohup env "DEVIN_WEB_PORT=$PORT" "DEVIN_WEB_STATE_DIR=$STATE" \
+  local launch_id
+  launch_id="$(new_launch_id)"
+  setsid nohup env "DEVIN_WEB_LAUNCH_ID=$launch_id" "DEVIN_WEB_PORT=$PORT" "DEVIN_WEB_STATE_DIR=$STATE" \
     "DEVIN_WEB_ACP_SOCK=$ACPD_SOCK" \
-    node "$ROOT/bin/devin-web-idle-restart.mjs" >>"$ACPD_WATCH_LOG" 2>&1 &
+    node "$ROOT/bin/process-identity.mjs" launch "$ACPD_IDLE_PIDFILE" idle >>"$ACPD_WATCH_LOG" 2>&1 9>&- &
   echo "idle-restart watcher armed — 'acpd restart' fires once all sessions are idle (log: $ACPD_WATCH_LOG)"
 }
 
 acpd_restart() {
+  guard_identity "$ACPD_PIDFILE" || return 1
   preflight || return 1
   case "${1:-}" in
     --when-idle) acpd_restart_when_idle; return ;;
@@ -276,13 +287,14 @@ acpd_restart() {
       ;;
     *) echo "usage: $0 acpd restart [--when-idle|--force]" >&2; return 2 ;;
   esac
-  acpd_stop || true
+  acpd_stop || return 1
   acpd_start
 }
 
 # ---------------- devin-web ----------------
 
 start() {
+  guard_managed || return 1
   preflight || return 1
   if pid_alive "$PIDFILE"; then
     rm -f "$DISABLED"
@@ -298,20 +310,21 @@ start() {
     mv "$LOG" "$LOG.1"
   fi
   local env_args=(env "DEVIN_WEB_STATE_DIR=$STATE" "DEVIN_WEB_ACP_FALLBACK=0")
-  local started_acpd="" started_web
+  local started_acpd="" started_web web_launch_id
   if [[ $ACPD_ENABLED != 0 ]]; then
     if ! acpd_start >/dev/null; then
       echo "error: devin-acpd failed to start — see $ACPD_LOG" >&2
       return 1
     fi
-    started_acpd="$STARTED_ACPD_PID"
+    started_acpd="$STARTED_ACPD_LAUNCH_ID"
     env_args+=("DEVIN_WEB_ACP_SOCK=$ACPD_SOCK" "DEVIN_WEB_HOST_SOCK=$HOST_SOCK")
     echo "using devin-acpd at $ACPD_SOCK"
   else
     echo "devin-acpd disabled (DEVIN_WEB_ACPD=0) — in-process acp mode"
   fi
   rm -f "$PIDFILE"
-  setsid nohup "${env_args[@]}" node "$ROOT/bin/devin-web.mjs" --port "$PORT" --no-open >>"$LOG" 2>&1 &
+  web_launch_id="$(new_launch_id)"
+  setsid nohup "${env_args[@]}" "DEVIN_WEB_LAUNCH_ID=$web_launch_id" node "$ROOT/bin/process-identity.mjs" launch "$PIDFILE" web --port "$PORT" --no-open >>"$LOG" 2>&1 9>&- &
   started_web=$!
   for _ in $(seq 1 30); do
     if ! kill -0 "$started_web" 2>/dev/null; then break; fi
@@ -325,12 +338,13 @@ start() {
     sleep 0.5
   done
   echo "devin-web failed to start at $URL — see $LOG" >&2
-  cleanup_created "$started_web" "$PIDFILE"
-  cleanup_created "$started_acpd" "$ACPD_PIDFILE"
+  cleanup_created "$PIDFILE" "$web_launch_id"
+  cleanup_created "$ACPD_PIDFILE" "$started_acpd"
   return 1
 }
 
 stop() {
+  guard_identity "$PIDFILE" || return 1
   if ! pid_alive "$PIDFILE"; then
     rm -f "$PIDFILE"
     local owner
@@ -345,7 +359,7 @@ stop() {
   fi
   local pid
   pid="$(cat "$PIDFILE")"
-  stop_tree "$PIDFILE"
+  stop_tree "$PIDFILE" || return 1
   if [[ $ACPD_ENABLED != 0 ]]; then
     echo "stopped web (was pid $pid) — devin-acpd and the agent keep running"
   else
@@ -354,6 +368,7 @@ stop() {
 }
 
 status() {
+  guard_managed || return 1
   acpd_status
   if pid_alive "$WATCH_PIDFILE"; then
     echo "devin-web-watch running (pid $(cat "$WATCH_PIDFILE"))"
@@ -396,23 +411,38 @@ open_url() {
   fi
 }
 
+# Serialize lifecycle decisions across ctl invocations. Detached services and
+# re-drives close fd 9 below, so they cannot retain the controller's lock.
+lock_lifecycle() {
+  ensure_state
+  exec 9>"$STATE/ctl.lock"
+  flock -w 30 9 || { echo "error: another lifecycle operation is still running" >&2; return 1; }
+}
+case "${1:-}" in
+  start|stop|restart|restart-all) lock_lifecycle ;;
+  acpd) case "${2:-}" in start|stop|restart) lock_lifecycle ;; esac ;;
+esac
+
 case "${1:-}" in
   -h|--help) echo "usage: $0 {start|stop [--all]|restart|restart-all|acpd {start|stop|status|restart [--when-idle|--force]}|status|logs [acpd] [-f]|search-compact|worktrees [rm <slug>]|open}" ;;
   start) start ;;
   stop)
+    guard_identity "$PIDFILE"
+    guard_identity "$WATCH_PIDFILE"
+    if [[ ${2:-} == --all ]]; then guard_identity "$ACPD_PIDFILE"; fi
     # an intentional stop stays down — mark it before anything dies so a
     # nested caller's detached re-drive still lands on the same marker
     ensure_state
     : >"$DISABLED"
     watch_stop
     if [[ ${2:-} == --all ]]; then
-      redrive_if_nested stop --all || { stop || true; acpd_stop; }
+      redrive_if_nested stop --all || { stop; acpd_stop; }
     else
-      redrive_if_nested stop || { stop || true; }
+      redrive_if_nested stop || { stop; }
     fi
     ;;
-  restart) restart_preflight; redrive_if_nested restart || { stop || true; start; } ;;   # web only — the daemon must not bounce
-  restart-all) restart_preflight; redrive_if_nested restart-all || { stop || true; acpd_stop || true; start; } ;;
+  restart) restart_preflight; redrive_if_nested restart || { stop; start; } ;;   # web only — the daemon must not bounce
+  restart-all) guard_identity "$ACPD_PIDFILE"; restart_preflight; redrive_if_nested restart-all || { stop; acpd_stop; start; } ;;
   acpd)
     case "${2:-}" in
       start) acpd_start ;;

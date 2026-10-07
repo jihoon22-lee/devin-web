@@ -6,7 +6,9 @@
 //   - hook missing → write it (0755)
 //   - hook identical → just ensure the exec bit
 //   - hook exists with DIFFERENT content → keep it, warn — never clobber
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { gitEnvironment } from "../lib/gitEnv.mjs";
+import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,24 +19,14 @@ exec pnpm verify
 `;
 
 export function installHooks({ root = ROOT, log = console.log } = {}) {
-  // .git may be a directory (normal clone) or a "gitfile" (worktree/
-  // submodule: `gitdir: <path>`) — resolve both without spawning git
-  let hooksDir = null;
+  // Ask Git: linked worktrees share the common hooks directory, and
+  // core.hooksPath (including inherited configuration) overrides it.
+  if (!existsSync(join(root, ".git"))) return 0;
+  let dst;
   try {
-    const dotGit = join(root, ".git");
-    const st = statSync(dotGit);
-    if (st.isDirectory()) {
-      hooksDir = join(dotGit, "hooks");
-    } else if (st.isFile()) {
-      const m = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)$/m);
-      if (m) hooksDir = join(resolve(root, m[1].trim()), "hooks");
-    }
-  } catch {
-    return 0; // no .git at all — tarball/exported tree, nothing to do
-  }
-  if (!hooksDir) return 0;
-
-  const dst = join(hooksDir, "pre-push");
+    dst = resolve(root, execFileSync("git", ["-C", root, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"], { encoding: "utf8", env: gitEnvironment(), stdio: ["ignore", "pipe", "pipe"] }).trim());
+  } catch { return 0; } // Git-free archives/installations remain supported.
+  const hooksDir = dirname(dst);
   try {
     if (existsSync(dst)) {
       const cur = readFileSync(dst, "utf8");
@@ -42,13 +34,13 @@ export function installHooks({ root = ROOT, log = console.log } = {}) {
         chmodSync(dst, 0o755); // identical content — keep the exec bit sure
         return 0;
       }
-      log(`install-hooks: .git/hooks/pre-push exists with different content — left untouched (wanted: ${JSON.stringify(HOOK_BODY)})`);
+      log(`install-hooks: ${dst} exists with different content — left untouched (wanted: ${JSON.stringify(HOOK_BODY)})`);
       return 0;
     }
     mkdirSync(hooksDir, { recursive: true });
     writeFileSync(dst, HOOK_BODY, { mode: 0o755 });
     chmodSync(dst, 0o755); // writeFile mode is umask-filtered — force it
-    log("install-hooks: installed .git/hooks/pre-push (pnpm verify)");
+    log(`install-hooks: installed ${dst} (pnpm verify)`);
   } catch (e) {
     log(`install-hooks: skipped (${e instanceof Error ? e.message : e})`);
   }

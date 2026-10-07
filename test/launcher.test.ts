@@ -23,7 +23,7 @@ afterEach(async () => {
 function fixture(build = true) {
   const root = mkdtempSync(join(tmpdir(), "dw-launcher-")); roots.push(root);
   mkdirSync(join(root, "bin")); mkdirSync(join(root, "lib"));
-  for (const file of ["devin-web.mjs", "runtime.mjs", "devin-web-ctl", "devin-web-watch.mjs"]) {
+  for (const file of ["devin-web.mjs", "runtime.mjs", "process-identity.mjs", "devin-web-ctl", "devin-web-watch.mjs"]) {
     if (existsSync(join(process.cwd(), "bin", file))) copyFileSync(join(process.cwd(), "bin", file), join(root, "bin", file));
   }
   copyFileSync(join(process.cwd(), "lib/paths.mjs"), join(root, "lib/paths.mjs"));
@@ -72,19 +72,20 @@ function serviceFixture() {
   `);
   writeFileSync(join(root, "bin/devin-acpd.mjs"), `
     import { createServer } from "node:net";
+    import { writeProcessIdentity } from "./process-identity.mjs";
     import { writeFileSync, rmSync } from "node:fs";
     const pidfile = process.env.DEVIN_WEB_ACPD_PIDFILE;
     const socket = process.env.DEVIN_WEB_ACP_SOCK;
     createServer().listen(socket, () => {
-      writeFileSync(pidfile, String(process.pid));
+      writeProcessIdentity(pidfile, "acpd");
       writeFileSync(process.env.DEVIN_WEB_STATE_DIR + "/created-acpd", String(process.pid));
     });
     process.on("SIGTERM", () => { rmSync(pidfile, {force:true}); rmSync(socket, {force:true}); process.exit(0); });
   `);
   return root;
 }
-async function ctl(root: string, args: string[], extra: Record<string, string | undefined>) {
-  return exec("bash", [join(root, "bin/devin-web-ctl"), ...args], { env: env(root, extra), timeout: 10000 }).then(
+async function ctl(root: string, args: string[], extra: Record<string, string | undefined>, timeout = 10000) {
+  return exec("bash", [join(root, "bin/devin-web-ctl"), ...args], { env: env(root, extra), timeout }).then(
     (result) => ({ ...result, code: 0 }), (error) => error as { stdout: string; stderr: string; code: number },
   );
 }
@@ -198,6 +199,173 @@ describe("public launcher boundaries", () => {
     expect(readFileSync(join(root, "state/pid"), "utf8")).toBe(String(sleeper.pid));
     expect(readFileSync(join(root, "state/web.disabled"), "utf8")).toBe("keep");
   });
+  it.each(["stop", "restart", "start", "status"])("ctl %s refuses a live legacy PID without harming its process", async (command) => {
+    const root = serviceFixture(); mkdirSync(join(root, "state"));
+    const sleeper = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" });
+    ownedProcesses.push(sleeper.pid!); sleeper.unref();
+    writeFileSync(join(root, "state/pid"), String(sleeper.pid));
+    const result = await ctl(root, [command], { PORT: await freePort(), DEVIN_WEB_ACPD: "0" });
+    expect(alive(sleeper.pid!)).toBe(true);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/ownership|identity|unverified/i);
+    expect(readFileSync(join(root, "state/pid"), "utf8")).toBe(String(sleeper.pid));
+    expect(existsSync(join(root, "state/web.disabled"))).toBe(false);
+  }, 15000);
+  it.each(["acpd.pid", "web-watch.pid", "acpd-idle-restart.pid"])("restart checks %s ownership before stopping the web", async (file) => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_DEVIN_BIN: "/isolated/fake-acp" };
+    expect((await ctl(root, ["start"], settings)).code).toBe(0);
+    const webPid = readFileSync(join(root, "state/pid"), "utf8");
+    const pidfile = join(root, "state", file), sidecar = `${pidfile}.identity.json`;
+    let saved: string | undefined;
+    if (file === "acpd-idle-restart.pid") {
+      const sleeper = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" });
+      ownedProcesses.push(sleeper.pid!); sleeper.unref(); writeFileSync(pidfile, String(sleeper.pid));
+    } else {
+      await expect.poll(() => existsSync(sidecar)).toBe(true);
+      saved = readFileSync(sidecar, "utf8"); rmSync(sidecar);
+    }
+    try {
+      const result = await ctl(root, ["restart"], settings);
+      expect(result.code).not.toBe(0);
+      expect(readFileSync(join(root, "state/pid"), "utf8")).toBe(webPid);
+      expect((await fetch(`http://127.0.0.1:${settings.PORT}`)).status).toBe(200);
+    } finally {
+      if (saved !== undefined) writeFileSync(sidecar, saved); else rmSync(pidfile, { force: true });
+      await ctl(root, ["stop", "--all"], settings);
+    }
+  }, 20000);
+  it.each(["web", "acpd"])("reaps a %s launch that hangs before publishing its service identity", async (role) => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: role === "web" ? "0" : "1", DEVIN_WEB_DEVIN_BIN: "/isolated/fake-acp" };
+    const script = role === "web" ? "devin-web.mjs" : "devin-acpd.mjs";
+    writeFileSync(join(root, "bin", script), `
+      import { writeFileSync } from "node:fs";
+      writeFileSync(process.env.DEVIN_WEB_STATE_DIR + "/stalled-pid", String(process.pid));
+      setInterval(() => {}, 1000);
+    `);
+    const result = await ctl(root, ["start"], settings, 22000);
+    const pid = Number(readFileSync(join(root, "state/stalled-pid"), "utf8"));
+    ownedProcesses.push(pid);
+    expect(result.code).not.toBe(0);
+    await expect.poll(() => alive(pid), { timeout: 2000 }).toBe(false);
+  }, 28000);
+  it("serializes simultaneous starts before either publishes launch ownership", async () => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
+    mkdirSync(join(root, "state"));
+    const runtime = join(root, "bin/runtime.mjs");
+    writeFileSync(runtime, readFileSync(runtime, "utf8").replace('if (process.argv.includes("--check-port")) await checkPort(options.port, options.host);', `
+      if (process.argv.includes("--check-port")) {
+        await checkPort(options.port, options.host);
+        const fs = await import("node:fs");
+        const marker = process.env.DEVIN_WEB_STATE_DIR + "/checked";
+        fs.appendFileSync(marker, "x");
+        const deadline = Date.now() + 500;
+        while (fs.readFileSync(marker, "utf8").length < 2 && Date.now() < deadline) await new Promise(r => setTimeout(r, 10));
+      }
+    `));
+    const web = join(root, "bin/devin-web.mjs");
+    writeFileSync(web, 'import { appendFileSync as recordLaunch } from "node:fs";\nrecordLaunch(process.env.DEVIN_WEB_STATE_DIR + "/launch-attempts", String(process.pid) + "\\n");\n' + readFileSync(web, "utf8").replace(/^#!.*\n/, ""));
+    try {
+      const results = await Promise.all([ctl(root, ["start"], settings), ctl(root, ["start"], settings)]);
+      const launches = readFileSync(join(root, "state/launch-attempts"), "utf8").trim().split("\n").map(Number);
+      ownedProcesses.push(...launches);
+      expect(results.map(r => r.code), results.map(r => r.stderr).join("\n")).toEqual([0, 0]);
+      expect(launches).toHaveLength(1);
+      expect((await fetch(`http://127.0.0.1:${settings.PORT}`)).status).toBe(200);
+    } finally { await ctl(root, ["stop"], settings); }
+  }, 18000);
+  it("refuses a second start while a verified launch is still initializing", async () => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
+    mkdirSync(join(root, "state"));
+    writeFileSync(join(root, "bin/devin-web.mjs"), 'setInterval(() => {}, 1000);');
+    const child = spawn(process.execPath, [join(root, "bin/process-identity.mjs"), "launch", join(root, "state/pid"), "web"], { env: env(root, { ...settings, DEVIN_WEB_LAUNCH_ID: "fixture-in-progress" }), detached: true, stdio: "ignore" });
+    ownedProcesses.push(child.pid!); child.unref();
+    await expect.poll(() => existsSync(join(root, "state/pid.launch"))).toBe(true);
+    const result = await ctl(root, ["start"], settings, 22000);
+    expect(result.code).not.toBe(0); expect(result.stderr).toMatch(/initializing|in.progress/);
+    expect(alive(child.pid!)).toBe(true);
+    expect(readFileSync(join(root, "state/pid.launch"), "utf8")).toBe(String(child.pid));
+  }, 26000);
+  it("reaps a captured child that ignores TERM after its verified group leader exits", async () => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
+    mkdirSync(join(root, "state"));
+    writeFileSync(join(root, "bin/stubborn-child.mjs"), `
+      import { writeFileSync } from "node:fs";
+      process.on("SIGTERM", () => {});
+      writeFileSync(process.env.DEVIN_WEB_STATE_DIR + "/stubborn-pid", String(process.pid));
+      setInterval(() => {}, 1000);
+    `);
+    writeFileSync(join(root, "bin/devin-web.mjs"), `
+      import { spawn } from "node:child_process";
+      import { existsSync } from "node:fs";
+      import { writeProcessIdentity } from "./process-identity.mjs";
+      spawn(process.execPath, [new URL("stubborn-child.mjs", import.meta.url).pathname], { stdio: "ignore" });
+      while (!existsSync(process.env.DEVIN_WEB_STATE_DIR + "/stubborn-pid")) await new Promise(r => setTimeout(r, 10));
+      writeProcessIdentity(process.env.DEVIN_WEB_STATE_DIR + "/pid", "web");
+      setInterval(() => {}, 1000);
+    `);
+    const child = spawn(process.execPath, [join(root, "bin/devin-web.mjs")], { env: env(root, settings), detached: true, stdio: "ignore" });
+    ownedProcesses.push(child.pid!); child.unref();
+    await expect.poll(() => existsSync(join(root, "state/pid"))).toBe(true);
+    const stubborn = Number(readFileSync(join(root, "state/stubborn-pid"), "utf8"));
+    await exec(process.execPath, [join(root, "bin/process-identity.mjs"), "stop", join(root, "state/pid"), "web"], { env: env(root, settings) });
+    await expect.poll(() => { try { return readFileSync(`/proc/${stubborn}/stat`, "utf8").split(") ")[1].startsWith("Z "); } catch { return true; } }).toBe(true);
+    expect(alive(child.pid!)).toBe(false);
+  }, 10000);
+  it("reports a lost identity during shutdown and never escalates against it", async () => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
+    mkdirSync(join(root, "state"));
+    writeFileSync(join(root, "bin/devin-web.mjs"), `
+      import { writeFileSync } from "node:fs";
+      import { writeProcessIdentity } from "./process-identity.mjs";
+      const file = process.env.DEVIN_WEB_STATE_DIR + "/pid";
+      const record = writeProcessIdentity(file, "web");
+      process.on("SIGTERM", () => { record.startTime = "changed"; writeFileSync(file + ".identity.json", JSON.stringify(record)); });
+      setInterval(() => {}, 1000);
+    `);
+    const child = spawn(process.execPath, [join(root, "bin/devin-web.mjs")], { env: env(root, settings), detached: true, stdio: "ignore" });
+    ownedProcesses.push(child.pid!); child.unref();
+    await expect.poll(() => existsSync(join(root, "state/pid"))).toBe(true);
+    const result = await exec(process.execPath, [join(root, "bin/process-identity.mjs"), "stop", join(root, "state/pid"), "web"], { env: env(root, settings) }).catch(error => error);
+    expect(result.code).not.toBeUndefined(); expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/ownership|identity|unverified/);
+    expect(alive(child.pid!)).toBe(true);
+    expect(existsSync(join(root, "state/pid.identity.json"))).toBe(true);
+  });
+  it.each(["startTime", "pgid", "config"])("ctl refuses changed %s ownership without signalling its service", async (field) => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
+    expect((await ctl(root, ["start"], settings)).code).toBe(0);
+    const path = join(root, "state/pid.identity.json");
+    const original = readFileSync(path, "utf8"); const record = JSON.parse(original);
+    if (field === "config") record.config.port = "1";
+    else record[field] = "wrong";
+    writeFileSync(path, JSON.stringify(record));
+    try {
+      const result = await ctl(root, ["stop"], settings);
+      expect(result.code).not.toBe(0);
+      expect(alive(Number(readFileSync(join(root, "state/pid"), "utf8")))).toBe(true);
+      expect((await fetch(`http://127.0.0.1:${settings.PORT}`)).status).toBe(200);
+    } finally { writeFileSync(path, original); await ctl(root, ["stop"], settings); }
+  }, 15000);
+  it.each(["managed", "legacy"])("explicit adoption verifies a %s service and rejects a foreign PID", async (mode) => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
+    if (mode === "managed") expect((await ctl(root, ["start"], settings)).code).toBe(0);
+    else {
+      const child = spawn(process.execPath, [join(root, "bin/devin-web.mjs"), "--no-open"], { env: env(root, settings), detached: true, stdio: "ignore" });
+      ownedProcesses.push(child.pid!); child.unref();
+      await expect.poll(() => existsSync(join(root, "state/pid"))).toBe(true);
+    }
+    const path = join(root, "state/pid.identity.json"); rmSync(path, { force: true });
+    const helper = join(root, "bin/process-identity.mjs");
+    const mismatched = await exec(process.execPath, [helper, "adopt", join(root, "state/pid"), "web"], { env: env(root, { ...settings, PORT: "1" }) }).catch(error => error);
+    expect(mismatched.code).not.toBe(0); expect(existsSync(path)).toBe(false);
+    await exec(process.execPath, [helper, "adopt", join(root, "state/pid"), "web"], { env: env(root, settings) });
+    const stopped = await ctl(root, ["stop"], settings);
+    expect(stopped.code, stopped.stderr).toBe(0);
+    const sleeper = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" });
+    ownedProcesses.push(sleeper.pid!); sleeper.unref(); writeFileSync(join(root, "state/pid"), String(sleeper.pid));
+    const result = await exec(process.execPath, [helper, "adopt", join(root, "state/pid"), "web"], { env: env(root, settings) }).catch(error => error);
+    expect(result.code).not.toBe(0); expect(alive(sleeper.pid!)).toBe(true); expect(existsSync(path)).toBe(false);
+  }, 15000);
   it.each(["", "000"])("ctl starts on PORT with prefix %j and carries custom dist and clean sockets through restart", async (prefix) => {
     const root = serviceFixture(); const port = await freePort();
     mkdirSync(join(root, "custom-build")); writeFileSync(join(root, "custom-build/BUILD_ID"), "build");

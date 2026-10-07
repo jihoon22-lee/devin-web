@@ -9,8 +9,9 @@
 // an intentional stop stays down. A live pid that fails health is logged
 // but left alone: ctl start would no-op on it anyway, and a compiling dev
 // server must not be bounced.
+import { processOwnership, writeProcessIdentity, removeProcessIdentity } from "./process-identity.mjs";
 import { stateDir } from "../lib/paths.mjs";
-import { appendFileSync, copyFileSync, existsSync, readFileSync, statSync, renameSync, truncateSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, statSync, renameSync, truncateSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,14 +68,9 @@ const rotateServiceLogs = () => {
 };
 
 const webPid = () => {
-  try {
-    const p = Number(readFileSync(WEB_PIDFILE, "utf8").trim());
-    if (p > 0) {
-      process.kill(p, 0);
-      return p;
-    }
-  } catch {}
-  return 0;
+  const owned = processOwnership(WEB_PIDFILE, "web");
+  // Unknown live ownership must not trigger a replacement launch.
+  return owned.status === "owned" ? owned.record.pid : owned.status === "unverified" ? -1 : 0;
 };
 
 let fails = 0;
@@ -109,6 +105,10 @@ const tick = async () => {
   }
   fails++;
   const pid = webPid();
+  if (pid < 0) {
+    note("unverified", "health failing and web process ownership unverified — refusing a replacement");
+    return;
+  }
   if (pid > 0) {
     note("wedged", `health failing but web pid ${pid} alive — leaving it`);
     return;
@@ -130,7 +130,8 @@ const tick = async () => {
 const IS_MAIN =
   process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (IS_MAIN) {
-  writeFileSync(PIDFILE, String(process.pid));
+  const identity = writeProcessIdentity(PIDFILE, "watch");
+  process.on("exit", () => removeProcessIdentity(PIDFILE, identity));
   log(`watching ${HEALTH} — ctl start after ${FAILS_NEEDED} consecutive failures`);
   // keep the interval REF'd — it IS this process's reason to stay alive
   setInterval(() => void tick().catch((e) => log(`tick error: ${e.message}`)), INTERVAL_MS);

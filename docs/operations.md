@@ -24,6 +24,20 @@ bin/devin-web-ctl acpd restart --when-idle
 
 This schedules the restart at an all-idle gap. It does not preserve idle user shells: PTYs still end when the daemon restarts. Finish shell work first. The idle watcher logs decisions to `acpd-watch.log`.
 
+Managed process control uses Linux `/proc` identity records alongside the numeric PID files (`*.identity.json`). The controller checks boot ID, process start time, executable/arguments, group/session and launch configuration before treating a process as owned. A live PID with missing or mismatched identity is left untouched and the operation fails. Lifecycle changes are serialized with `flock`; detached services do not retain the controller lock. Managed launches record separate `.launch` ownership before application initialization; a failed start cleans up only its unique launch token, and another start is refused while initialization is pending. Shutdown snapshots verified descendants in the owned group and checks each process identity again before TERM or KILL, including children that outlive their leader; it never sends a negative-PGID signal. `/proc` validation and the following PID signal are separate system calls, so this is not an atomic kernel pidfd guarantee. Processes whose identity changes are left untouched. Use the same installation directory and exported configuration for lifecycle commands; changing the configured port, build directory or daemon sockets requires stopping the old configuration first.
+
+When upgrading a running installation that predates identity records, explicitly register its existing processes before invoking the new controller. From the existing installation directory, export its actual startup environment (including `DEVIN_WEB_STATE_DIR` and any custom port/socket settings), inspect the PID files, then register each live component:
+
+```bash
+node bin/process-identity.mjs adopt "$DEVIN_WEB_STATE_DIR/pid" web
+node bin/process-identity.mjs adopt "${DEVIN_WEB_ACPD_PIDFILE:-$DEVIN_WEB_STATE_DIR/acpd.pid}" acpd
+node bin/process-identity.mjs adopt "$DEVIN_WEB_STATE_DIR/web-watch.pid" watch
+# Only if an idle-restart watcher is already armed:
+node bin/process-identity.mjs adopt "$DEVIN_WEB_STATE_DIR/acpd-idle-restart.pid" idle
+```
+
+Adoption validates the live process's script path, installation root, state directory and configuration before recording its identity; it sends no signals and makes no socket connections. Omit absent components. Resolve any mismatch instead of deleting a live PID file. Until registration finishes, an old watchdog still checks health but a recovery call into the new controller can refuse unverified ownership. Complete registration promptly while the existing services are healthy. Moving to another installation directory requires an idle maintenance window for the daemon as well: ownership is bound to the original source directory.
+
 ## Manual updates
 
 There is no automatic source updater. In a Git checkout, first review local changes and the intended upstream revision. Back up user state before a change that may affect storage.

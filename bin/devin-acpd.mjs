@@ -14,7 +14,7 @@ import { stateDir } from "../lib/paths.mjs";
 import { createDaemon } from "../lib/acp/daemon.mjs";
 import { createHost } from "../lib/acp/host.mjs";
 import { join } from "node:path";
-import { writeFileSync, rmSync } from "node:fs";
+import { writeProcessIdentity, removeProcessIdentity } from "./process-identity.mjs";
 
 const STATE_DIR = stateDir();
 const sockPath = process.env.DEVIN_WEB_ACP_SOCK ?? join(STATE_DIR, "acp.sock");
@@ -46,14 +46,14 @@ await host.start();
 // own the pidfile — a `setsid … &` caller's $! can be a short-lived wrapper,
 // so the only trustworthy pid is ours
 const PIDFILE = process.env.DEVIN_WEB_ACPD_PIDFILE ?? join(STATE_DIR, "acpd.pid");
-writeFileSync(PIDFILE, String(process.pid));
+const identity = writeProcessIdentity(PIDFILE, "acpd");
 log(`listening on ${sockPath} + ${hostSock} (pid ${process.pid})`);
 
 const shutdown = async (sig) => {
   log(`${sig} — shutting down`);
   await daemon.stop();
   await host.stop();
-  rmSync(PIDFILE, { force: true });
+  removeProcessIdentity(PIDFILE, identity);
   process.exit(0);
 };
 process.on("SIGTERM", () => void shutdown("SIGTERM"));

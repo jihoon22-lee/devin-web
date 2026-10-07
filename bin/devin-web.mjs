@@ -2,11 +2,12 @@
 // devin-web — web UI for Devin CLI.
 // Usage: devin-web [--port N] [--host H] [--no-open] [--dev]
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, statSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { stateDir as resolveStateDir } from "../lib/paths.mjs";
+import { writeProcessIdentity, removeProcessIdentity } from "./process-identity.mjs";
 import { checkPort, launchOptions, preflight } from "./runtime.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -66,12 +67,8 @@ if (stateDir) {
   try {
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
     chmodSync(stateDir, 0o700);
-    writeFileSync(pidfile, String(process.pid));
-    process.on("exit", () => {
-      try {
-        if (readFileSync(pidfile, "utf8") === String(process.pid)) unlinkSync(pidfile);
-      } catch {}
-    });
+    const identity = writeProcessIdentity(pidfile, "web", childEnv);
+    process.on("exit", () => removeProcessIdentity(pidfile, identity));
   } catch (error) {
     console.error(`devin-web: cannot prepare private state directory ${stateDir}: ${error.message}`);
     process.exit(1);
