@@ -5,6 +5,8 @@ const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 export interface ChangedFile {
   path: string;
+  /** Rename source, retained so file actions operate on both sides. */
+  originalPath?: string;
   status: string;
   /** X column: a change is in the index (unstage applies). */
   staged: boolean;
@@ -58,9 +60,9 @@ export async function gitRoot(cwd: string): Promise<string> {
 
 /** `git status --porcelain=v1 -z`: records "XY path\0"; renames and copies
  *  are followed by an extra "origPath\0" record. */
-export function parsePorcelainZ(out: string): { path: string; status: string; staged: boolean; unstaged: boolean }[] {
+export function parsePorcelainZ(out: string): Pick<ChangedFile, "path" | "originalPath" | "status" | "staged" | "unstaged">[] {
   const parts = out.split("\0");
-  const files: { path: string; status: string; staged: boolean; unstaged: boolean }[] = [];
+  const files: ReturnType<typeof parsePorcelainZ> = [];
   for (let i = 0; i < parts.length; i++) {
     const rec = parts[i];
     if (rec.length < 4) continue;
@@ -69,6 +71,7 @@ export function parsePorcelainZ(out: string): { path: string; status: string; st
     const y = xy[1] ?? " ";
     files.push({
       path: rec.slice(3),
+      ...(xy.includes("R") ? { originalPath: parts[i + 1] } : {}),
       status: xy.trim() || "?",
       staged: "MADRCT".includes(x),
       unstaged: "MDT".includes(y) || x === "?",
@@ -132,8 +135,22 @@ export const stageFile = async (cwd: string, file: string) =>
   git(await gitRoot(cwd), ["add", "--", file]);
 
 /** Unstage one file (worktree copy kept). */
-export const unstageFile = async (cwd: string, file: string) =>
-  git(await gitRoot(cwd), ["restore", "--staged", "--", file]);
+export async function unstageFile(cwd: string, file: string) {
+  cwd = await gitRoot(cwd);
+  return git(cwd, ["restore", "--staged", "--", ...await changePaths(cwd, file)]);
+}
+
+/** Query the whole status: restricting to the new path hides the rename source. */
+export async function changePaths(cwd: string, file: string): Promise<string[]> {
+  if (!isSafeRelPath(file)) throw new Error("invalid path");
+  const files = parsePorcelainZ(await git(cwd, ["status", "--porcelain=v1", "-z", "-uall"]));
+  const entry = files.find((f) => f.path === file);
+  if (entry?.originalPath) {
+    if (!isSafeRelPath(entry.originalPath)) throw new Error("invalid rename source");
+    return [entry.originalPath, file];
+  }
+  return [file];
+}
 
 /** Discard a file's changes — `git clean -f` for untracked files (no HEAD
  *  version to restore to), `git restore` for tracked ones. */
@@ -141,7 +158,7 @@ export async function revertFile(cwd: string, file: string) {
   cwd = await gitRoot(cwd);
   const st = await git(cwd, ["status", "--porcelain=v1", "-z", "--", file]);
   if (st.startsWith("??")) return git(cwd, ["clean", "-f", "--", file]);
-  return git(cwd, ["restore", "--worktree", "--staged", "--", file]);
+  return git(cwd, ["restore", "--worktree", "--staged", "--", ...await changePaths(cwd, file)]);
 }
 
 /** Commits run hooks (lint-staged, tests) and may wait on GPG signing — the

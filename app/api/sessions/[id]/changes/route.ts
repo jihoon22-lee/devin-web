@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { manager } from "@/lib/state";
-import { changedFiles, commitStaged, currentBranch, filePatch, gitRoot, isSafeRelPath, revertFile, stageFile, unstageFile } from "@/lib/gitChanges";
+import { changedFiles, changePaths, commitStaged, currentBranch, filePatch, gitRoot, isSafeRelPath, revertFile, stageFile, unstageFile } from "@/lib/gitChanges";
 import { backupBeforeRevert, undoRevert } from "@/lib/revertTrash";
 
 export const dynamic = "force-dynamic";
@@ -77,7 +77,7 @@ export async function POST(req: Request, ctx: Ctx) {
         if (!file) return NextResponse.json({ error: "file required" }, { status: 400 });
         // copy the worktree bytes aside first — Revert is otherwise final
         const root = await gitRoot(cwd);
-        const undoId = backupBeforeRevert(root, file);
+        const undoId = backupBeforeRevert(root, file, await changePaths(root, file));
         await revertFile(root, file);
         return NextResponse.json({ ok: true, undoId });
       }
