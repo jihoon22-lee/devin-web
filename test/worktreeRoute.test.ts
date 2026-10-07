@@ -33,7 +33,7 @@ const req = (body: object) =>
   new Request("http://localhost/api/sessions", { method: "POST", body: JSON.stringify(body) });
 
 function repo() {
-  const d = mkdtempSync(join(tmpdir(), "dw-wt-repo-"));
+  const d = mkdtempSync(join(dir, "repo-"));
   execFileSync("git", ["-C", d, "init", "-q"]);
   writeFileSync(join(d, "f.txt"), "x\n");
   execFileSync("git", ["-C", d, "-c", "user.email=t@t", "-c", "user.name=t", "add", "."]);
@@ -73,7 +73,7 @@ describe("POST /api/sessions {worktree:true}", () => {
   });
 
   it("rejects a non-git cwd with a clear error", async () => {
-    const d = mkdtempSync(join(tmpdir(), "dw-wt-plain-"));
+    const d = mkdtempSync(join(dir, "plain-"));
     const res = await POST(new (await import("next/server")).NextRequest(req({ cwd: d, worktree: true })));
     expect(res.status).toBe(500);
     expect((await res.json()).error).toMatch(/git/i);
@@ -109,9 +109,24 @@ describe("POST /api/sessions cwd validation", () => {
     expect(res.status).toBe(400);
   });
 
+  it("rejects existing and absent outside-root paths alike before disclosing directory existence", async () => {
+    const { setFsRootsForTest } = await import("../lib/fsRoots");
+    setFsRootsForTest([join(dir, "allowed")]);
+    try {
+      for (const cwd of [dir, join(dir, "missing-outside-root")]) {
+        const res = await post({ cwd });
+        expect(res.status).toBe(403);
+        expect(await res.json()).toEqual({ error: `cwd outside DEVIN_WEB_FS_ROOTS: ${cwd}` });
+      }
+      expect(live.createdCwds).toEqual([]);
+    } finally {
+      setFsRootsForTest(null);
+    }
+  });
+
   it("with DEVIN_WEB_FS_ROOTS configured, a cwd outside the roots is 403 — a session cwd would auto-widen the allowlist", async () => {
     const { setFsRootsForTest } = await import("../lib/fsRoots");
-    const allowed = mkdtempSync(join(tmpdir(), "dw-roots-"));
+    const allowed = mkdtempSync(join(dir, "roots-"));
     setFsRootsForTest([allowed]);
     try {
       const denied = await post({ cwd: "/" });
