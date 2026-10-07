@@ -24,6 +24,8 @@ Keep these files outside the source repository, back them up with suitable permi
 
 ## Dependency checks
 
+Release publication also requires successful CodeQL checks and no open high/critical code-scanning alerts on main. Individual findings require code review before dismissal; see the [initial review record](security/codeql-review.md). No query family is disabled.
+
 CI audits the locked dependency graph and rejects high/critical advisories unless an explicit, reviewed development-only exception matches its advisory, package version, dependency path, and expiry. [security/audit-exceptions.json](security/audit-exceptions.json) records the rationale and source for each exception. Exceptions are not a statement that an advisory is fixed; remove them when a supported patched dependency is available or the exposure changes.
 
 The initial exception covers `braces` 3.0.3 through the Next.js ESLint development dependency, expiring **2026-11-06**. The [upstream advisory](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm) describes stack exhaustion from deeply nested brace patterns and lists no patched version at the time of review. The reviewed production dependency graph does not include this package; repository-controlled lint patterns run on disposable CI runners without application secrets. This rationale does not extend to runtime use or untrusted input reaching brace expansion. Recheck the production dependency graph when dependencies change.

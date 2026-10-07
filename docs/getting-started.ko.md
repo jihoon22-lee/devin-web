@@ -12,6 +12,8 @@
 
 Corepack이 있는 Node 환경에서는 `corepack enable`, `corepack prepare pnpm@9.15.9 --activate`로 pnpm 버전을 맞출 수 있습니다. 없다면 지원되는 pnpm 설치 방법을 사용하고 `node --version`, `pnpm --version`을 확인하세요.
 
+초기 릴리스의 실제 사용자 흐름은 Devin CLI **3000.11.3**으로 검증했습니다. 다른 CLI 버전을 사용할 때는 상태 배지에서 스키마 호환성을 확인하세요.
+
 ## 설치와 실행
 
 ```bash

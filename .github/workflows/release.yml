@@ -70,6 +70,7 @@ jobs:
     permissions:
       contents: write
       checks: read
+      security-events: read
     steps:
       # Deliberately no checkout, package install or project code in the write job.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -91,9 +92,18 @@ jobs:
           test "$(jq -r .version release/manifest.json)" = "$VERSION"
           test "$(jq -r .source release/manifest.json)" = "devin-web-$VERSION.tar.gz"
           (cd release && sha256sum --check SHA256SUMS)
-          gh api "repos/$GH_REPO/commits/$CANDIDATE/check-runs" --paginate --jq '.check_runs[] | [.name,.conclusion] | @tsv' > checks.tsv
-          grep -Fx $'CI Gate\tsuccess' checks.tsv
-          grep -E '^CodeQL.*\ssuccess$' checks.tsv
+          gh api "repos/$GH_REPO/commits/$CANDIDATE/check-runs?filter=latest&per_page=100" --paginate --slurp > checks.json
+          jq -e '[.[].check_runs[] | select(.name == "CI Gate")] | length > 0 and all(.[]; .conclusion == "success")' checks.json
+          jq -e '[.[].check_runs[] | select(.name | startswith("CodeQL"))] | length > 0 and all(.[]; .conclusion == "success")' checks.json
+          # A successful analysis job alone does not mean its findings were reviewed.
+          gh api "repos/$GH_REPO/code-scanning/alerts?state=open&ref=refs/heads/main&per_page=100" --paginate --slurp > alerts.json
+          jq -e '
+            type == "array" and length > 0 and
+            all(.[]; type == "array" and all(.[];
+              (.rule | type == "object" and has("security_severity_level")) and
+              (.rule.security_severity_level as $s | [null, "low", "medium", "high", "critical"] | index($s) != null))) and
+            ([.[][] | select(.rule.security_severity_level == "high" or .rule.security_severity_level == "critical")] | length == 0)
+          ' alerts.json
           # A matching pre-existing tag or release is a hard failure.
           if gh api "repos/$GH_REPO/git/ref/tags/v$VERSION" >/dev/null 2>&1; then exit 1; fi
           if gh release view "v$VERSION" >/dev/null 2>&1; then exit 1; fi

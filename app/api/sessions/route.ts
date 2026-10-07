@@ -111,17 +111,18 @@ export async function POST(req: NextRequest) {
     const dir = cwd || manager().defaultCwd;
     // a session's cwd is auto-added to the fs allowlist via sessionRoots —
     // validate while it's still caller input, or one POST could open the
-    // whole tree when DEVIN_WEB_FS_ROOTS is configured
+    // whole tree when DEVIN_WEB_FS_ROOTS is configured. Check before stat
+    // so rejected paths cannot disclose whether a directory exists.
+    const roots = configuredRoots();
+    if (roots.length > 0 && !pathInRoots(dir, roots)) {
+      return NextResponse.json({ error: `cwd outside DEVIN_WEB_FS_ROOTS: ${dir}` }, { status: 403 });
+    }
     try {
       if (!statSync(dir).isDirectory()) {
         return NextResponse.json({ error: `not a directory: ${dir}` }, { status: 400 });
       }
     } catch {
       return NextResponse.json({ error: `not a directory: ${dir}` }, { status: 400 });
-    }
-    const roots = configuredRoots();
-    if (roots.length > 0 && !pathInRoots(dir, roots)) {
-      return NextResponse.json({ error: `cwd outside DEVIN_WEB_FS_ROOTS: ${dir}` }, { status: 403 });
     }
     const m = manager();
     // persisted sessionDefaults (model/thought_level/speed) applied before

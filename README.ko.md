@@ -1,5 +1,7 @@
 # devin-web
 
+[![CI](https://github.com/jihoon22-lee/devin-web/actions/workflows/ci.yml/badge.svg)](https://github.com/jihoon22-lee/devin-web/actions/workflows/ci.yml)
+
 [English](README.md) · [한국어 시작 안내](docs/getting-started.ko.md) · [상세 문서 (English)](docs/README.md)
 
 [Devin CLI](https://devin.ai)를 데스크톱과 휴대폰의 브라우저에서 사용하는 자체 호스팅 웹 인터페이스입니다. 대화 스트리밍, 권한 승인, 파일 탐색, Git 변경 검토, 실제 터미널을 제공합니다. 관리 모드에서는 웹을 재시작해도 에이전트 작업과 터미널이 유지됩니다.

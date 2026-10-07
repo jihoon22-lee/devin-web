@@ -20,6 +20,12 @@ ACPD_LOG="$STATE/acpd.log"
 ACPD_SOCK="${DEVIN_WEB_ACP_SOCK:-$STATE/acp.sock}"
 HOST_SOCK="${DEVIN_WEB_HOST_SOCK:-$STATE/host.sock}"
 PORT="${DEVIN_WEB_PORT-${PORT-7100}}"
+# Match the launcher's decimal normalization without shell arithmetic (which
+# treats leading zeroes as octal). Invalid values still fail Node preflight.
+if [[ $PORT =~ ^[0-9]+$ ]]; then
+  PORT="${PORT#"${PORT%%[!0]*}"}"
+  PORT="${PORT:-0}"
+fi
 URL="http://127.0.0.1:$PORT"
 ACPD_ENABLED="${DEVIN_WEB_ACPD:-1}"
 WATCH_PIDFILE="$STATE/web-watch.pid"

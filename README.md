@@ -1,5 +1,7 @@
 # devin-web
 
+[![CI](https://github.com/jihoon22-lee/devin-web/actions/workflows/ci.yml/badge.svg)](https://github.com/jihoon22-lee/devin-web/actions/workflows/ci.yml)
+
 [한국어](README.ko.md) · [Getting started](docs/getting-started.md) · [Documentation](docs/README.md)
 
 A self-hosted browser interface for [Devin CLI](https://devin.ai), with streaming conversations, permission prompts, project files, Git changes, and real terminals. Resume local CLI sessions from a desktop or phone. Managed mode keeps the agent and terminals alive across web restarts.
