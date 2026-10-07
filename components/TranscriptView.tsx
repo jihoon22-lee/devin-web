@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { displayTitle } from "@/lib/client/display";
 import Markdown from "./Markdown";
 import { ArrowDown, ChevronDown, ChevronRight, Lock, LockOpen, Menu, RefreshCw, Wrench } from "lucide-react";
@@ -24,19 +24,20 @@ export interface TranscriptItem {
   tool?: ToolCallUpdate;
 }
 
-export default function TranscriptView({
-  session,
-  jump,
-  onRetry,
-  onTakeover,
-  onOpenSidebar,
-}: {
+interface Props {
   session: SessionInfo;
   jump?: JumpTarget | null;
   onRetry: () => void;
   onTakeover?: () => void;
   onOpenSidebar?: () => void;
-}) {
+}
+
+export default function TranscriptView(props: Props) {
+  // State and cursors are owned by one session lifetime, including A → B → A.
+  return <SessionTranscriptView key={props.session.sessionId} {...props} />;
+}
+
+function SessionTranscriptView({ session, jump, onRetry, onTakeover, onOpenSidebar }: Props) {
   const [items, setItems] = useState<TranscriptItem[] | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -47,7 +48,21 @@ export default function TranscriptView({
   const [live, setLive] = useState(false);
   const [active, setActive] = useState(false);
   const [flash, setFlash] = useState<number | null>(null);
-  const jumpDone = useRef(0);
+  const jumpDone = useRef<JumpTarget | null>(null);
+  const jumpPages = useRef<{ target: JumpTarget; count: number } | null>(null);
+  const [jumpError, setJumpError] = useState<{ target: JumpTarget; message: string } | null>(null);
+  const lifetime = useRef<AbortController | null>(null);
+  const pendingLoad = useRef<AbortSignal | null>(null);
+  const windowVersion = useRef(0);
+  const olderRequest = useRef<{ controller: AbortController; target?: JumpTarget } | null>(null);
+  useLayoutEffect(() => {
+    const controller = new AbortController();
+    lifetime.current = controller;
+    return () => {
+      controller.abort();
+      olderRequest.current?.controller.abort();
+    };
+  }, []);
   const { scrollRef, onScroll, atBottom, jumpToBottom, unpin } = useStickToBottom(items, session.sessionId);
   const lastId = useRef(0);
   // items actually flowing in the last ~15s → the CLI process is working
@@ -88,60 +103,60 @@ export default function TranscriptView({
     });
   }, []);
 
-  // incremental: only fetch items newer than the newest node we've rendered
-  const load = useCallback(
-    () =>
-      api<{ items: TranscriptItem[]; truncated: boolean; reset?: boolean }>(
-        `/api/sessions/${session.sessionId}/transcript${lastId.current ? `?after=${lastId.current}` : ""}`,
-      )
-        .then((r) => {
-          if (r.reset || lastId.current === 0) {
-            setItems(r.items);
-            setTruncated(r.truncated);
-          }
-          else if (r.items.length) {
-            merge(r.items);
-            if (baseLoaded.current) markActivity();
-          }
-          baseLoaded.current = true;
-          const tail = r.items[r.items.length - 1];
-          if (tail?.id) lastId.current = Math.max(lastId.current, tail.id);
-          // Incremental replies describe only the new tail, not whether
-          // older pages still exist above our current history window.
-          setErr(null); // a recovered fetch must clear a stale "Failed to fetch"
-        })
-        .catch((e) => setErr((e as Error).message)),
-    [session.sessionId, merge, markActivity],
-  );
+  // Serialize REST polls so two baseline/delta responses cannot arrive out
+  // of order and regress either the displayed window or its REST cursor.
+  const load = useCallback(async () => {
+    const signal = lifetime.current?.signal;
+    if (!signal || signal.aborted || pendingLoad.current === signal) return;
+    pendingLoad.current = signal;
+    const after = lastId.current;
+    try {
+      const r = await api<{ items: TranscriptItem[]; truncated: boolean; reset?: boolean }>(
+        `/api/sessions/${session.sessionId}/transcript${after ? `?after=${after}` : ""}`,
+        { signal },
+      );
+      if (signal.aborted) return;
+      if (r.reset || after === 0) {
+        windowVersion.current++;
+        olderRequest.current?.controller.abort();
+        olderRequest.current = null;
+        shift.current = null;
+        setLoadingOlder(false);
+        setItems(r.items);
+        setTruncated(r.truncated);
+        lastId.current = 0;
+      } else if (r.items.length) {
+        merge(r.items);
+        if (baseLoaded.current) markActivity();
+      }
+      baseLoaded.current = true;
+      const tail = r.items[r.items.length - 1];
+      if (tail?.id) lastId.current = Math.max(lastId.current, tail.id);
+      setErr(null);
+    } catch (e) {
+      if (!signal.aborted) setErr((e as Error).message);
+    } finally {
+      if (pendingLoad.current === signal) pendingLoad.current = null;
+    }
+  }, [session.sessionId, merge, markActivity]);
 
   // near-live: the mux stream pushes new items on every db commit (no refetch
   // roundtrip). The server-side transcript cursor resyncs itself on reconnect,
   // so only the REST fallback poll remains for belt-and-suspenders coverage.
-  // session switch resets the view — done during render so the previous
-  // transcript never shows under the new header; the effect below only
-  // re-subscribes and kicks off the (async) load
-  const [prevSid, setPrevSid] = useState(session.sessionId);
-  if (prevSid !== session.sessionId) {
-    setPrevSid(session.sessionId);
-    setItems(null);
-    setActive(false);
-  }
-
   useEffect(() => {
-    lastId.current = 0;
-    baseLoaded.current = false;
-    lastActivity.current = 0;
+    const signal = lifetime.current!.signal;
     // subscribe first — the baseline REST query then covers rows committed
     // before the stream's tip, so nothing falls in the REST↔tip gap
     const unsub = streamSub("transcript", session.sessionId, (msg) => {
       // server pushes {kind:"transcript", type:"items", items, lastId}
-      if (Array.isArray(msg.items)) {
+      if (!signal.aborted && Array.isArray(msg.items)) {
         merge(msg.items as TranscriptItem[]);
         markActivity();
       }
     });
-    void load();
+    queueMicrotask(() => void load());
     const unsubState = onStreamState((ok) => {
+      if (signal.aborted) return;
       setLive(ok);
       if (ok) void load(); // recover anything missed while disconnected
     });
@@ -165,50 +180,103 @@ export default function TranscriptView({
     };
   }, [session.sessionId, load, merge, markActivity]);
 
-  // search-hit jump: scroll to the matched node (once per pick) and flash it
-  useEffect(() => {
-    if (!jump || items == null || jumpDone.current === jump.n) return;
-    const target =
-      (jump.nodeId != null ? items.find((m) => m.id === jump.nodeId) : undefined) ??
-      items.find((m) => anchorMatch(m.text, jump.anchor));
-    if (!target || target.id == null) return;
-    jumpDone.current = jump.n;
-    unpin();
-    // wait a frame so any pending render puts the node in the DOM
-    requestAnimationFrame(() => {
-      document.getElementById(`msg-${target.id}`)?.scrollIntoView({ block: "center" });
-      setFlash(target.id!);
-      setTimeout(() => setFlash(null), 1800);
-    });
-  }, [jump, items, unpin]);
-
-  // page backwards from the oldest rendered node; overlap at the seam is
-  // dropped by id so a re-click can't duplicate rows
-  const loadOlder = useCallback(() => {
+  // A page belongs to both the session lifetime and the baseline window.
+  // A full REST reset invalidates pages requested against the old window.
+  const loadOlder = useCallback(async (target?: JumpTarget) => {
     const first = items?.find((i) => i.id != null);
-    if (!first?.id || loadingOlder) return;
+    const signal = lifetime.current?.signal;
+    if (!first?.id || !signal || signal.aborted || olderRequest.current) return false;
+    const request = { controller: new AbortController(), target };
+    olderRequest.current = request;
+    const version = windowVersion.current;
     const el = scrollRef.current;
     if (el) shift.current = el.scrollHeight - el.scrollTop;
     setLoadingOlder(true);
-    api<{ items: TranscriptItem[]; truncated: boolean }>(
-      `/api/sessions/${session.sessionId}/transcript?before=${first.id}&tail=50`,
-    )
-      .then((r) => {
-        setItems((prev) => {
-          const have = new Set((prev ?? []).map((i) => i.id));
-          return [...r.items.filter((i) => i.id == null || !have.has(i.id)), ...(prev ?? [])];
-        });
-        setTruncated(r.truncated);
-      })
-      .catch((e) => setErr((e as Error).message))
-      .finally(() => setLoadingOlder(false));
-  }, [items, loadingOlder, scrollRef, session.sessionId]);
+    try {
+      const r = await api<{ items: TranscriptItem[]; truncated: boolean }>(
+        `/api/sessions/${session.sessionId}/transcript?before=${first.id}&tail=50`,
+        { signal: request.controller.signal },
+      );
+      if (signal.aborted || request.controller.signal.aborted || version !== windowVersion.current) return false;
+      setItems((prev) => {
+        const have = new Set((prev ?? []).map((i) => i.id));
+        return [...r.items.filter((i) => i.id == null || !have.has(i.id)), ...(prev ?? [])];
+      });
+      setTruncated(r.truncated);
+      setErr(null);
+      const progress = r.items.some((i) => i.id != null && i.id < first.id!);
+      if (target && !progress) {
+        jumpDone.current = target;
+        setJumpError({ target, message: "Search result not found in the loaded history." });
+      }
+      return progress;
+    } catch (e) {
+      if (!signal.aborted && !request.controller.signal.aborted) {
+        setErr((e as Error).message);
+        if (target) {
+          jumpDone.current = target;
+          setJumpError({ target, message: "Search result not found in the loaded history." });
+        }
+      }
+      return false;
+    } finally {
+      if (!signal.aborted && olderRequest.current === request) {
+        olderRequest.current = null;
+        setLoadingOlder(false);
+      }
+    }
+  }, [items, scrollRef, session.sessionId]);
+
+  // A new pick cancels only pages issued for the previous pick; manual
+  // pagination can still finish. Unmount also aborts all page requests.
+  useEffect(() => () => {
+    const request = olderRequest.current;
+    if (request && jump && request.target === jump) {
+      request.controller.abort();
+      olderRequest.current = null;
+      shift.current = null;
+      setLoadingOlder(false);
+    }
+  }, [jump]);
+
+  useEffect(() => {
+    if (!jump || items == null || jumpDone.current === jump) return;
+    if (jumpPages.current?.target !== jump) jumpPages.current = { target: jump, count: 0 };
+    const target = jump.nodeId != null
+      ? items.find((m) => m.id === jump.nodeId)
+      : items.find((m) => anchorMatch(m.text, jump.anchor));
+    if (target?.id != null) {
+      unpin();
+      const frame = requestAnimationFrame(() => {
+        jumpDone.current = jump;
+        document.getElementById(`msg-${target.id}`)?.scrollIntoView({ block: "center" });
+        setFlash(target.id!);
+      });
+      return () => cancelAnimationFrame(frame);
+    }
+    const first = items.find((m) => m.id != null);
+    const canPage = jump.nodeId != null && first?.id != null && jump.nodeId < first.id && truncated;
+    if (canPage && jumpPages.current.count < 20) {
+      if (loadingOlder || olderRequest.current) return;
+      jumpPages.current.count++;
+      void loadOlder(jump);
+      return;
+    }
+    jumpDone.current = jump;
+    queueMicrotask(() => setJumpError({ target: jump, message: "Search result not found in the loaded history." }));
+  }, [jump, items, truncated, loadingOlder, loadOlder, unpin]);
 
   useEffect(() => {
     if (shift.current == null || !scrollRef.current) return;
     scrollRef.current.scrollTop = scrollRef.current.scrollHeight - shift.current;
     shift.current = null;
   }, [items, scrollRef]);
+
+  useEffect(() => {
+    if (flash == null) return;
+    const timer = setTimeout(() => setFlash(null), 1800);
+    return () => clearTimeout(timer);
+  }, [flash]);
 
   const owner = session.lockedBy;
 
@@ -276,13 +344,14 @@ export default function TranscriptView({
             )}
             {truncated && (
               <button
-                onClick={loadOlder}
+                onClick={() => void loadOlder()}
                 disabled={loadingOlder}
                 className="self-center text-xs text-(--color-dim) hover:text-white px-3 py-1 rounded-full border border-(--color-border) hover:bg-(--color-panel2) disabled:opacity-50"
               >
                 {loadingOlder ? "Loading…" : "Load earlier messages"}
               </button>
             )}
+            {jumpError && jumpError.target === jump && <div role="status" className="text-(--color-dim) text-sm">{jumpError.message}</div>}
             {err && <div className="text-(--color-red) text-sm">{err}</div>}
             {items === null && !err && <div className="text-(--color-dim) text-sm">Loading…</div>}
             {items?.map((m, i) => (

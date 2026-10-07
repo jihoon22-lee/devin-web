@@ -11,6 +11,9 @@ import { integrityBeacon } from "@/lib/client/integrity";
 import { diag, onServerRestart, onStreamState, resubscribe, streamSub } from "@/lib/client/stream";
 import { api } from "@/lib/client/api";
 
+const waitingForDurable = (state: SessionState) =>
+  (state.durableScannedThrough ?? state.durableThrough ?? 0) < (state.durableThrough ?? 0);
+
 /** One authoritative snapshot followed by contiguous view patches. Durable
  *  deltas use the transcript sub; pagination only extends the durable region. */
 export function useSessionView(sessionId: string | null) {
@@ -23,6 +26,9 @@ export function useSessionView(sessionId: string | null) {
   const lifecycle = useRef<{ sid: string | null; cancelled: boolean; generation: number } | null>(null);
 
   const push = useCallback(() => {
+    // Keep the last coherent regions on screen across the view/transcript
+    // delivery seam. Metadata and the completed turn become visible together.
+    if (waitingForDurable(stateRef.current)) return;
     setBox({ sid: sessionId, state: { ...stateRef.current } });
     const b = integrityBeacon(stateRef.current, sessionId);
     if (!b) {
@@ -48,6 +54,9 @@ export function useSessionView(sessionId: string | null) {
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
     let repairing = false;
     let seeded = false;
+    let durableTimer: ReturnType<typeof setTimeout> | null = null;
+    let pendingRows: TranscriptItem[] = [];
+    let scannedThrough = 0;
     const schedule = () => {
       if (flushTimer) return;
       flushTimer = setTimeout(() => {
@@ -61,6 +70,30 @@ export function useSessionView(sessionId: string | null) {
       diag("viewgap", { s: sessionId, have: stateRef.current.v ?? 0, got: v });
       // The transport owns bounded retries, readiness and wanted ownership.
       void resubscribe("view", sessionId).catch(() => { repairing = false; });
+    };
+    const deliveryWait = () => {
+      if (!waitingForDurable(stateRef.current)) {
+        if (durableTimer) clearTimeout(durableTimer);
+        durableTimer = null;
+      } else if (!durableTimer) {
+        // This is a recovery deadline, not a grace period for silencing
+        // integrity checks. A completed scan still reports missing anchors.
+        durableTimer = setTimeout(() => {
+          durableTimer = null;
+          if (life.cancelled || !waitingForDurable(stateRef.current)) return;
+          diag("durablegap", { s: sessionId, have: stateRef.current.durableScannedThrough, want: stateRef.current.durableThrough });
+          repair(stateRef.current.v ?? 0);
+        }, 2000);
+      }
+    };
+    const applyPending = (draft: SessionState, rows: TranscriptItem[] = [], delivered = scannedThrough) => {
+      const through = draft.durableThrough ?? 0;
+      const all = [...pendingRows, ...rows];
+      applyDurableDelta(draft, all);
+      const future = all.filter(row => (row.id ?? 0) > through);
+      draft.durableScannedThrough = Math.max(draft.durableScannedThrough ?? 0, Math.min(delivered, through));
+      pendingRows = future;
+      scannedThrough = delivered;
     };
     const unsubView = streamSub("view", sessionId, (msg) => {
       const f = msg.view as ViewFrame | undefined;
@@ -80,21 +113,40 @@ export function useSessionView(sessionId: string | null) {
         life.generation++;
         seeded = true;
         repairing = false;
+        pendingRows = [];
+        scannedThrough = f.durableThrough;
+      } else {
+        applyPending(draft);
       }
       stateRef.current = draft;
+      deliveryWait();
       schedule();
     });
     const unsubTx = streamSub("transcript", sessionId, (msg) => {
       const items = msg.items;
-      if (life.cancelled || !seeded || !Array.isArray(items) || !items.length) return;
+      if (life.cancelled || !seeded || !Array.isArray(items)) return;
       const draft = { ...stateRef.current, items: [...stateRef.current.items] };
       try {
-        applyDurableDelta(draft, items as TranscriptItem[]);
+        if (items.some(row => !row || !Number.isSafeInteger(row.id) || row.id < 0))
+          throw new Error("invalid transcript node id");
+        const lastId = msg.lastId;
+        // Old senders/tests may omit lastId; visible rows still prove progress.
+        const delivered = Number.isSafeInteger(lastId) && (lastId as number) >= 0
+          ? lastId as number : items.reduce((n, row) => Number.isSafeInteger(row?.id) ? Math.max(n, row.id) : n, 0);
+        applyPending(draft, items as TranscriptItem[], Math.max(scannedThrough, delivered));
       } catch (err) {
         diag("jsrej", { m: `delta:${err instanceof Error ? err.message : err}` });
         return;
       }
       stateRef.current = draft;
+      if (pendingRows.length > 4096) {
+        // Bound reordering storage. The fresh snapshot supplies the canonical
+        // tail instead of silently forgetting already acknowledged rows.
+        pendingRows = [];
+        scannedThrough = draft.durableScannedThrough ?? 0;
+        repair(draft.v ?? 0);
+      }
+      deliveryWait();
       schedule();
     });
     const unsubState = onStreamState(setConnected);
@@ -104,12 +156,17 @@ export function useSessionView(sessionId: string | null) {
       repairing = false;
       lastIntegrity.current = "";
       stateRef.current = emptySessionState();
+      pendingRows = [];
+      scannedThrough = 0;
+      if (durableTimer) clearTimeout(durableTimer);
+      durableTimer = null;
       setBox({ sid: sessionId, state: stateRef.current });
     });
     return () => {
       life.cancelled = true;
       unsubView(); unsubTx(); unsubState(); unsubRestart();
       if (flushTimer) clearTimeout(flushTimer);
+      if (durableTimer) clearTimeout(durableTimer);
     };
   }, [sessionId, push]);
 

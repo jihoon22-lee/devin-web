@@ -36,6 +36,8 @@ Metadata comes from `reduceEvent`; new keys must be added to `META_KEYS`, and re
 
 The separate transcript subscription provides durable commits and older pagination. Those replies extend durable rows only within the current watermark; they cannot replace authoritative retained state. Results from an old session, epoch, or replaced snapshot are discarded.
 
+View patches and transcript deltas can arrive separately at a turn boundary. The browser tracks the transcript's acknowledged raw `lastId` independently of the view's `durableThrough`. It keeps the last coherent rendered regions until the new watermark has been delivered, and holds early rows above the watermark for the corresponding view patch. Filtered-only commits still send an empty delta with their completion cursor. A stalled delivery requests a fresh view snapshot after two seconds; this deadline triggers recovery, rather than suppressing integrity alarms. Once delivery completes, anchors beyond the delivered durable tail still report `orphanAnchor`. An empty, untruncated snapshot also proves missing anchors; an empty truncated tail does not, because its anchors may belong to older history.
+
 ## Regions, identity, and finalization
 
 The displayed conversation consists of four inputs:
@@ -63,7 +65,7 @@ The daemon tracks loaded sessions and buffers relevant traffic while the web rec
 
 A restarted web adopts already-live sessions. **Do not call `session/load` on a live daemon-adopted session to populate its UI**: that can disrupt its turn. Seed the view from metadata, itemlog, frozen durable history, and current runtime; fetch older history through transcript pagination.
 
-Provisional items and retained ephemera persist best-effort in `itemlog.db`. Boot-scoped turn IDs prevent a new process from modifying a dead turn. Before new event sequences are allocated, restore logged regions and floor the local sequence above their saved `seqTo`. View versions are a separate number space.
+Provisional updates persist best-effort in `itemlog.db`; finalization writes the latest assembler snapshot and retained selection in one transaction. Alignment or finalization failures preserve the old region for retry. ACP completion and the CLI database commit are independent: an ended region containing agent content must also wait for durable progress before a new turn replaces it. Empty regions and user-echo-only endings can retire without a commit. A subsequent prompt stays in the persisted queue until the previous region can finalize. Retries run independently of browser traffic, use backoff, and preserve queue identities and order. If durable progress never arrives, the old region stays recoverable and the UI explains how to retrieve the queued prompt or continue in a new session; an error/cancel response is not proof that no later commit can arrive. Boot-scoped turn IDs prevent a new process from modifying a dead turn. Before new event sequences are allocated, restore logged regions and floor the local sequence above their saved `seqTo`. View versions are a separate number space.
 
 The prompt queue persists in `prompt-queue.json`; larger attachments live in `queue-blobs/`. Hydrate it before draining. Queue edits/removals update ghost bubbles; the actual user bubble comes from assembly when a prompt drains. Session deletion pauses draining, clears state on success, and preserves/resumes it on failure. Late completion of a deleted session cannot revive a replacement session with the same identifier.
 

@@ -173,6 +173,9 @@ export class AcpBridge {
     // Retain incomplete multibyte characters across transport chunks.
     proc.stdout?.setEncoding("utf8");
     proc.stdout?.on("data", (d) => {
+      // Buffered frames from an exited/replaced transport belong to that
+      // generation too; never capture the replacement as their requester.
+      if (this.proc !== proc || this.gen !== gen) return;
       for (const line of decoder.push(d.toString("utf8"))) {
         let msg: JsonRpcMessage;
         try {
@@ -234,7 +237,7 @@ export class AcpBridge {
   async daemonState(): Promise<{
     gen: number;
     acpPid?: number | null;
-    sessions: { sessionId: string; cwd: string | null; loadResult: unknown; busy: boolean }[];
+    sessions: { sessionId: string; cwd: string | null; loadResult: unknown; busy: boolean; remainingPrompts?: number }[];
   } | null> {
     try {
       return await this.request("_devin-web/shim_state", {}, { timeoutMs: 5000 });
@@ -315,6 +318,8 @@ export class AcpBridge {
   private handleAgentRequest(req: JsonRpcRequest) {
     const { id, method, params } = req;
     const p = (params ?? {}) as Record<string, unknown>;
+    const requester = this.proc;
+    const current = () => requester != null && this.proc === requester;
 
     if (CLIENT_HANDLED.has(method)) {
       const key = JSON.stringify([p.sessionId, method, id]);
@@ -325,18 +330,20 @@ export class AcpBridge {
         requestId,
         method,
         params: p,
-        respond: (result) => this.respond(id, result),
-        respondError: (code, message) => this.respondError(id, code, message),
+        respond: (result) => { if (current()) this.respond(id, result); },
+        respondError: (code, message) => { if (current()) this.respondError(id, code, message); },
       });
       return;
     }
 
     void this.serveLocally(method, p)
       .then((result) => {
+        if (!current()) return;
         if (process.env.DEVIN_WEB_DEBUG) console.error(`[acp>] ${method} -> ${JSON.stringify(result)?.slice(0, 300)}`);
         this.respond(id, result);
       })
       .catch((e: Error) => {
+        if (!current()) return;
         console.error(`[acp!] ${method} error: ${e.message}`);
         this.respondError(id, -32603, e.message || "internal error");
       });

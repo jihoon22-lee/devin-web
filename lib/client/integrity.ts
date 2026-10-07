@@ -57,9 +57,9 @@ export function integrityBeacon(
   // is missing: an alignment or delivery leak, never pagination
   const dur = state.durable ?? [];
   const maxDurable = dur.reduce((m, i) => Math.max(m, Number(i.id.slice(3)) || 0), 0);
-  const orphans = dur.length
+  const orphans = dur.length || (state.durableScannedThrough != null && !state.historyTruncated)
     ? (state.retained ?? []).filter((i) => i.anchor != null && i.anchor > maxDurable).length
-    : 0; // no durable yet — the seed hasn't landed, anchors can't be judged
+    : 0; // no seed, or an empty truncated tail with anchors in older history
   if (!report.dupes.length && !report.disorder.length && !sunk && !orphans) return null;
   return {
     sig: `${report.dupes.length}:${report.disorder.length}:${report.dupes[0]?.b ?? ""}:${sunk?.pushed ?? 0}:${sunk?.inserted ?? 0}:${orphans}`,

@@ -230,6 +230,88 @@ describe("devin-acpd", () => {
     c.close();
   });
 
+  it.each([[3, 4, "success"], [4, 3, "success"], [3, 4, "error"], [4, 3, "error"], [3, 4, "cancel"], [4, 3, "cancel"], [3, 4, "unavailable"]] as const)("a real manager drains two adopted prompts only after both settle (%s then %s, %s)", async (firstId, lastId, outcome) => {
+    const { SessionManager } = await import("../lib/acp/manager");
+    const { socketConnector } = await import("../lib/acp/transport");
+    const { sockPath } = await startDaemon();
+    const previous = rpcClient(sockPath);
+    previous.send({ id: 1, method: "initialize" });
+    await previous.waitFor((l) => JSON.parse(l).id === 1);
+    const sessionId = `adopt-real-${firstId}-${outcome}`;
+    previous.send({ id: 2, method: "session/load", params: { sessionId, cwd: "/tmp" } });
+    await previous.waitFor((l) => JSON.parse(l).id === 2);
+    for (const id of [3, 4]) previous.send({ id, method: "session/prompt", params: { sessionId, _defer: true } });
+    previous.send({ id: 5, method: "_devin-web/shim_state" });
+    await previous.waitFor((l) => JSON.parse(l).id === 5);
+    previous.close();
+    const manager = new SessionManager();
+    Object.assign(manager.bridge, { connector: socketConnector(sockPath) });
+    try {
+      await manager.ensure();
+      expect(manager.getSession(sessionId)).toMatchObject({ adopted: true, running: true });
+      expect(await manager.prompt(sessionId, [{ type: "text", text: "queued after restart" }])).toEqual({ queued: true });
+      const finish = (id: number) => manager.bridge.notify("TEST_EMIT", { line: JSON.stringify({ id,
+        ...(outcome === "error" ? { error: { code: -1, message: "prompt failed" } } :
+          { result: { stopReason: outcome === "cancel" ? "cancelled" : "end_turn" } }),
+      }) });
+      if (outcome === "cancel") manager.cancel(sessionId);
+      finish(firstId);
+      await vi.waitFor(async () => {
+        expect((await manager.bridge.daemonState())?.sessions.find((s) => s.sessionId === sessionId)?.remainingPrompts).toBe(1);
+      });
+      expect(manager.queueState(sessionId).queued).toBe(1);
+      expect(manager.getSession(sessionId)?.running).toBe(true);
+      const probe = outcome === "unavailable"
+        ? vi.spyOn(manager.bridge, "daemonState").mockResolvedValueOnce(null) : null;
+      finish(lastId);
+      if (probe) {
+        await vi.waitFor(() => expect(probe).toHaveBeenCalled());
+        expect(manager.queueState(sessionId).queued).toBe(1);
+        expect(manager.getSession(sessionId)?.running).toBe(true);
+        await manager.ensure(); // recovery uses the real daemon snapshot
+      }
+      await vi.waitFor(() => {
+        expect(manager.queueState(sessionId).queued).toBe(0);
+        expect(manager.getSession(sessionId)?.running).toBe(false);
+      });
+      expect(manager.provisional(sessionId)).toContainEqual(expect.objectContaining({ role: "user", text: "queued after restart" }));
+    } finally {
+      manager.bridge.kill();
+      // Dispose the DB subscription established by the isolated manager.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (manager as any).dbSub?.();
+    }
+  });
+
+  it.each([false, true])("reports remaining prompts across reconnect and out-of-order completions (error: %s)", async (failed) => {
+    const { sockPath } = await startDaemon();
+    const first = rpcClient(sockPath);
+    first.send({ id: 1, method: "initialize" });
+    await first.waitFor((l) => JSON.parse(l).id === 1);
+    first.send({ id: 2, method: "session/load", params: { sessionId: "parallel" } });
+    await first.waitFor((l) => JSON.parse(l).id === 2);
+    for (const id of [3, 4]) first.send({ id, method: "session/prompt", params: { sessionId: "parallel", _defer: true } });
+    first.send({ id: 5, method: "_devin-web/shim_state" });
+    await first.waitFor((l) => JSON.parse(l).id === 5);
+    first.close();
+    const next = rpcClient(sockPath);
+    next.send({ id: 6, method: "initialize" });
+    await next.waitFor((l) => JSON.parse(l).id === 6);
+    try {
+      // Complete the newer request first, then the original (success/error).
+      next.send({ method: "TEST_EMIT", params: { line: JSON.stringify({ id: 4, ...(failed ? { error: { code: -1, message: "cancelled" } } : { result: {} }) }) } });
+      const partial = JSON.parse(await next.waitFor((l) => JSON.parse(l).method === "_devin-web/turn_end"));
+      expect(partial.params.remainingPrompts).toBe(1);
+      next.send({ id: 7, method: "_devin-web/shim_state" });
+      const busy = JSON.parse(await next.waitFor((l) => JSON.parse(l).id === 7));
+      expect(busy.result.sessions[0]).toMatchObject({ busy: true, remainingPrompts: 1 });
+      next.send({ method: "TEST_EMIT", params: { line: JSON.stringify({ id: 3, result: { stopReason: "cancelled" } }) } });
+      await next.waitFor((l) => JSON.parse(l).method === "_devin-web/turn_end" && JSON.parse(l).params.remainingPrompts === 0);
+      next.send({ id: 8, method: "_devin-web/shim_state" });
+      expect(JSON.parse(await next.waitFor((l) => JSON.parse(l).id === 8)).result.sessions[0].busy).toBe(false);
+    } finally { next.close(); }
+  });
+
   it("tracks busy sessions via session/prompt and synthesizes turn_end", async () => {
     const { sockPath } = await startDaemon();
     const c = rpcClient(sockPath);

@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 
 const { api } = vi.hoisted(() => ({ api: vi.fn() }));
 vi.mock("@/lib/client/api", () => ({ api }));
+vi.mock("../components/ConfirmDialog", () => ({ useConfirm: () => async () => "confirm" }));
 import ChangesPanel from "../components/ChangesPanel";
 
 const listing = (path: string) => ({
@@ -73,4 +74,15 @@ it("turns diff-line comments into one composer prompt", async () => {
   expect(text).toContain("why 60?");
   expect(onOpenChat).toHaveBeenCalled();
   expect(localStorage.getItem("dw-review:R")).toBeNull();
+});
+
+it("offers Undo when discard fails after making a safety copy", async () => {
+  vi.spyOn(window, "confirm").mockReturnValue(true);
+  api.mockImplementation((_path: string, init?: RequestInit) => init?.method === "POST"
+    ? Promise.reject(Object.assign(new Error("restore failed"), { body: { undoId: "backup-id" } }))
+    : Promise.resolve(listing("file.txt")));
+  render(<ChangesPanel sessionId="recovery" />);
+  await act(async () => {});
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Discard changes in file.txt" })); });
+  expect(screen.queryByText("Undo revert: file.txt")).not.toBeNull();
 });

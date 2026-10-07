@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import type { ViewFrame } from "../lib/acp/sessionView";
+import type { TranscriptItem } from "../lib/transcript";
 import { emptySessionState } from "../lib/client/model";
 import type { useSessionView as Hook } from "../hooks/useSessionView";
 
@@ -43,6 +44,16 @@ const send = (view: ViewFrame, sid = "A") => act(() => source().msg({ kind: "vie
 const connect = (epoch = "one") => act(() => {
   source().open(); source().msg({ kind: "meta", type: "ready", epoch });
 });
+
+const flip = (): ViewFrame => ({
+  t: "patch", v: 2, durableThrough: 20, prov: { order: [], upsert: [] },
+  retained: [{ id: "thought", kind: "text", role: "thought", text: "kept thought", done: true, seqFrom: 1, seqTo: 1, anchorNode: 20 }],
+});
+const integrityPosts = () => vi.mocked(fetch).mock.calls.filter(([path, init]) =>
+  path === "/api/diag" && JSON.parse(init!.body as string).t === "integrity");
+const delta = (items: unknown[], lastId: number) => act(() =>
+  source().msg({ kind: "transcript", id: "A", type: "items", items, lastId }));
+const twenty: TranscriptItem = { id: 20, role: "assistant", text: "twenty", ts: 2 };
 
 beforeEach(async () => {
   vi.resetModules(); vi.useFakeTimers(); FakeES.all = [];
@@ -86,6 +97,80 @@ afterEach(async () => {
   cleanup(); for (const stop of stopped) stop();
   await vi.advanceTimersByTimeAsync(0);
   vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals();
+});
+
+it("keeps the last coherent turn until its durable delta arrives without an orphan alarm", async () => {
+  const { result } = renderHook(() => useSessionView("A")); connect(); await flush();
+  send(flip()); await flush(40); // view flush precedes the server's 60ms DB debounce
+  expect(integrityPosts()).toEqual([]);
+  expect(result.current.state.v).toBe(1);
+  delta([twenty], 20); await flush();
+  expect(result.current.state.v).toBe(2);
+  expect(result.current.state.durable?.map(i => i.id)).toEqual(["bf-10", "bf-20"]);
+  expect(result.current.state.retained?.[0].anchor).toBe(20);
+  expect(integrityPosts()).toEqual([]);
+});
+
+it("holds a future-watermark delta until the view permits it", async () => {
+  const { result } = renderHook(() => useSessionView("A")); connect(); await flush();
+  delta([twenty], 20); await flush();
+  expect(result.current.state.durable?.map(i => i.id)).toEqual(["bf-10"]);
+  send(flip()); await flush();
+  expect(result.current.state.durable?.map(i => i.id)).toEqual(["bf-10", "bf-20"]);
+  expect(integrityPosts()).toEqual([]);
+});
+
+it("reports a genuinely missing anchor after an empty delivery completion", async () => {
+  const { result } = renderHook(() => useSessionView("A")); connect(); await flush();
+  send(flip()); delta([], 20); await flush();
+  expect(result.current.state.v).toBe(2);
+  expect(integrityPosts()).toHaveLength(1);
+  expect(JSON.parse(integrityPosts()[0][1]!.body as string).orphanAnchor).toBe(1);
+});
+
+it("repairs stalled durable delivery from an authoritative snapshot", async () => {
+  const { result } = renderHook(() => useSessionView("A")); connect(); await flush();
+  serverView = { ...snapshot(3), durable: [twenty], durableThrough: 20 };
+  send(flip()); await flush(2500);
+  expect(result.current.state.v).toBe(3);
+  expect(result.current.state.durable?.map(i => i.id)).toEqual(["bf-20"]);
+  expect(integrityPosts()).toEqual([]);
+});
+
+it("does not commit delivery progress from a malformed transcript frame", async () => {
+  const { result } = renderHook(() => useSessionView("A")); connect(); await flush();
+  delta([null], 20); send(flip()); await flush();
+  expect(result.current.state.v).toBe(1);
+  expect(integrityPosts()).toEqual([]);
+  delta([twenty], 20); await flush();
+  expect(result.current.state.v).toBe(2);
+  expect(result.current.state.durable?.map(i => i.id)).toEqual(["bf-10", "bf-20"]);
+});
+
+it("a stalled-delivery repair still reports an anchor missing from its snapshot", async () => {
+  renderHook(() => useSessionView("A")); connect(); await flush();
+  serverView = { ...snapshot(3), durableThrough: 20, retained: (flip() as Extract<ViewFrame, { t: "patch" }>).retained! };
+  send(flip()); await flush(2500);
+  expect(integrityPosts()).toHaveLength(1);
+  expect(JSON.parse(integrityPosts()[0][1]!.body as string).orphanAnchor).toBe(1);
+});
+
+it("reports retained anchors missing from an authoritative empty snapshot", async () => {
+  serverView = { ...snapshot(1), durable: [], durableTruncated: false, durableThrough: 20, retained: (flip() as Extract<ViewFrame, { t: "patch" }>).retained! };
+  renderHook(() => useSessionView("A")); connect(); await flush();
+  expect(integrityPosts()).toHaveLength(1);
+  expect(JSON.parse(integrityPosts()[0][1]!.body as string).orphanAnchor).toBe(1);
+});
+
+it("cancels an old session's durable repair and pending rows on session change", async () => {
+  const { result, rerender } = renderHook(({ sid }) => useSessionView(sid), { initialProps: { sid: "A" } });
+  connect(); await flush(); delta([twenty], 20);
+  send({ t: "patch", v: 2, durableThrough: 30 });
+  rerender({ sid: "B" }); await flush(); const count = posts.length;
+  await flush(2500);
+  expect(posts).toHaveLength(count);
+  expect(result.current.state.durable?.map(i => i.id)).toEqual(["bf-10"]);
+  expect(integrityPosts()).toEqual([]);
 });
 
 it("renders a snapshot, contiguous patches and durable deltas with watermark clamping", async () => {
@@ -333,4 +418,14 @@ it("preserves a repair whose pending HTTP request fails while disconnected", asy
   await act(async () => release()); await flush(5000);
   serverView = snapshot(6, "reconnected repair"); connect(); await flush();
   expect(result.current.state.title).toBe("reconnected repair");
+});
+
+it("review: does not diagnose older retained history against an empty truncated tail", async () => {
+  // Canonical reads have a bounded filtered-row hop budget. An all-filtered
+  // recent window can be empty while the retained anchor remains on an older
+  // page; durableTruncated explicitly says this is not the complete history.
+  serverView = { ...snapshot(1), durable: [], durableTruncated: true, durableThrough: 10000,
+    retained: (flip() as Extract<ViewFrame, { t: "patch" }>).retained! };
+  renderHook(() => useSessionView("A")); connect(); await flush();
+  expect(integrityPosts()).toEqual([]);
 });

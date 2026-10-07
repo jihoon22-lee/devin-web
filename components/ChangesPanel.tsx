@@ -12,6 +12,7 @@ import { useConfirm } from "./ConfirmDialog";
 
 interface ChangedFile {
   path: string;
+  originalPath?: string;
   status: string;
   staged: boolean;
   unstaged: boolean;
@@ -293,6 +294,12 @@ function SessionChanges({ sessionId, onOpenChat }: { sessionId: string; onOpenCh
       }
       load();
     } catch (e) {
+      const body = e instanceof Error && "body" in e ? e.body : null;
+      if (action === "revert" && file && body && typeof body === "object" &&
+          "undoId" in body && typeof body.undoId === "string") {
+        setUndo({ id: body.undoId, file });
+      }
+      load(); // git may have changed part of the worktree before failing
       toast(`${action} failed: ${(e as Error).message}`);
     } finally {
       setBusy(null);
@@ -401,7 +408,9 @@ function SessionChanges({ sessionId, onOpenChat }: { sessionId: string; onOpenCh
                   className="flex-1 min-w-0 flex items-center gap-2 px-3 py-2.5 md:py-1.5 text-left"
                 >
                   <span className={`w-4 shrink-0 text-2xs font-medium ${st.cls}`}>{st.label}</span>
-                  <span className="mono text-xs flex-1 min-w-0 truncate" title={f.path}>{f.path}</span>
+                  <span className="mono text-xs flex-1 min-w-0 truncate" title={f.originalPath ? `${f.originalPath} → ${f.path}` : f.path}>
+                    {f.originalPath ? `${f.originalPath} → ${f.path}` : f.path}
+                  </span>
                   {f.staged && (
                     <span className="text-tiny px-1 rounded bg-(--color-green)/15 text-(--color-green) shrink-0">
                       staged
@@ -443,7 +452,7 @@ function SessionChanges({ sessionId, onOpenChat }: { sessionId: string; onOpenCh
                     onClick={() => {
                       void confirm({
                         title: `Discard changes in ${f.path}?`,
-                        body: "You can undo this for 10 minutes (worktree content only).",
+                        body: `${f.originalPath ? "Both paths of this rename will be restored. " : ""}You can undo this for 10 minutes (file content, links and permissions; staging is not restored).`,
                         confirmLabel: "Discard",
                         danger: true,
                       }).then((r) => {

@@ -65,6 +65,14 @@ interface ActiveSession {
    *  set that notification is ignored so the queue shifts exactly once (in
    *  runPrompt's finally), never twice */
   ownsTurn?: boolean;
+  /** Identity of the runPrompt invocation allowed to settle this session. */
+  ownedRun?: symbol;
+  /** Back off storage recovery retries without consuming queued prompts. */
+  turnRetryAfter?: number;
+  turnRetryDelay?: number;
+  turnRetryTimer?: ReturnType<typeof setTimeout>;
+  turnRetryStartedAt?: number;
+  turnRetryWarned?: boolean;
   /** send-now steered prompts still in flight. A merged steer resolves with
    *  its turn; an unmerged one runs its own turn no runPrompt owns — keep
    *  `running` held until the last one settles so mid-steer updates still
@@ -361,13 +369,22 @@ export class SessionManager {
       onExit: (code, signal) => {
         this.broadcastGlobal({ type: "agent_exit", data: { code, signal } });
         this.generation++;
-        // a turn this process owns ends through runPrompt's rejection; an
-        // adopted one has no pending prompt, so nothing else would tell its
-        // viewers (or its still-open region) that the turn is gone
+        // Invalidate ownership before promise continuations can run. An old
+        // daemon-state query or steer may settle after a replacement turn
+        // starts on this same session object.
         for (const s of this.sessions.values()) {
-          const wasAdoptedTurn = s.running && !s.ownsTurn;
+          this.clearTurnRetry(s);
+          const wasRunning = s.running;
+          const owned = s.ownsTurn;
           s.running = false;
-          if (wasAdoptedTurn && !s.deleted) this.emit(s.sessionId, "session_state", { running: false });
+          s.ownsTurn = false;
+          s.ownedRun = undefined;
+          s.steerInFlight = 0;
+          s.steerSawTurnEnd = false;
+          if (wasRunning && !s.deleted) {
+            if (owned) this.emit(s.sessionId, "turn_error", { message: "devin acp exited" });
+            else this.emit(s.sessionId, "session_state", { running: false });
+          }
         }
         // The agent is gone — pending permission/elicitation cards can never be
         // answered now. Reject them so the UI dismisses the cards instead of
@@ -405,6 +422,14 @@ export class SessionManager {
     const daemonBusy = new Map(
       (ds?.sessions ?? []).filter((s) => s.busy).map((s) => [s.sessionId, s]),
     );
+    // A completion's state query can fail during a web/daemon reconnect.
+    // Reconcile on the next ensure as well, so fail-safe queue retention
+    // does not become a permanent stall after the daemon is reachable again.
+    for (const d of ds?.sessions ?? []) {
+      const s = this.sessions.get(d.sessionId);
+      if (s?.attachedGen === this.generation && d.busy === false && (d.remainingPrompts ?? 0) === 0)
+        this.finishIdleAdoptedTurn(s);
+    }
     let changed = false;
     // mid-turn sessions the web never knew about (fresh process, empty map):
     // adopt them too so the sidebar shows them running instead of dormant
@@ -423,10 +448,6 @@ export class SessionManager {
       this.emitCaps(d.sessionId, d.loadResult);
       this.emit(d.sessionId, "session_state", { adopted: true, running: true });
       changed = true;
-    }
-    if (!stale.length) {
-      if (changed) this.broadcastGlobal({ type: "sessions_changed", data: {} });
-      return;
     }
     // parallel — ensure() awaits this, so serial loads would stack each
     // session's worst-case timeout onto every API call behind it
@@ -477,7 +498,8 @@ export class SessionManager {
     // sessions actually attached to the CURRENT generation (backoff and
     // adopted-busy ones skip: running=true / stale attachedGen).
     for (const s of this.sessions.values()) {
-      if (s.deleting || s.running || !s.queue.length || s.attachedGen !== this.generation) continue;
+      if (s.deleting || s.running || !s.queue.length || s.attachedGen !== this.generation ||
+          (s.turnRetryAfter ?? 0) > Date.now()) continue;
       const next = s.queue.shift();
       if (next) {
         this.persistQueue(s);
@@ -623,6 +645,29 @@ export class SessionManager {
     return this.pending.cancel(requestId, sessionId);
   }
 
+  /** A failed/absent daemon state is unknown, never proof of idle. The
+   *  query also makes new-web/old-daemon upgrades safe without a restart. */
+  private async daemonStillBusy(s: ActiveSession): Promise<boolean> {
+    if (!this.bridge.socketMode) return false;
+    const generation = this.generation;
+    const state = await this.bridge.daemonState();
+    if (generation !== this.generation || this.sessions.get(s.sessionId) !== s || s.deleted) return true;
+    const session = state?.sessions?.find((entry) => entry.sessionId === s.sessionId);
+    return session?.busy !== false || (session.remainingPrompts ?? 0) > 0;
+  }
+
+  private finishIdleAdoptedTurn(s: ActiveSession) {
+    if (!s.running || s.ownsTurn || s.steerInFlight || s.deleted) return;
+    s.running = false;
+    this.emit(s.sessionId, "turn_end", {});
+    this.afterTurn(s);
+  }
+
+  private async finishAdoptedTurn(s: ActiveSession) {
+    if (await this.daemonStillBusy(s)) return;
+    this.finishIdleAdoptedTurn(s);
+  }
+
   // ---------- notifications ----------
 
   private onSessionUpdate(n: SessionNotification) {
@@ -636,7 +681,7 @@ export class SessionManager {
   }
 
   private onNotification(method: string, params: unknown) {
-    const p = params as { sessionId?: string } | undefined;
+    const p = params as { sessionId?: string; remainingPrompts?: number } | undefined;
     // daemon-synthesized turn end: a prompt issued before a web restart has no
     // pending request here to resolve — this is how an adopted session's
     // running state clears when the turn actually finishes
@@ -647,24 +692,16 @@ export class SessionManager {
       // notification too would shift the queue twice and run prompts in
       // parallel
       if (s?.running && !s.ownsTurn) {
-        if (s.steerInFlight) {
-          // a steer can be running its own turn — the daemon also piggybacks
-          // turn_end on the ORIGINAL prompt's response, so this signal must
-          // not clear running yet; the steer's settle decides instead
+        if (typeof p.remainingPrompts === "number" && p.remainingPrompts > 0) return;
+        if (this.bridge.socketMode) {
+          // Old daemons emit this for EVERY prompt response. Query their
+          // current busy state rather than treating that response as idle.
+          void this.finishAdoptedTurn(s).catch((e) => console.error("[manager] adopted turn completion:", e));
+        } else if (s.steerInFlight) {
           s.steerSawTurnEnd = true;
-          return;
+        } else {
+          this.finishIdleAdoptedTurn(s);
         }
-        s.running = false;
-        this.emit(p.sessionId, "turn_end", {});
-        this.broadcastGlobal({ type: "sessions_changed", data: {} });
-        const next = s.deleting ? undefined : s.queue.shift();
-        if (next) this.persistQueue(s);
-        this.emit(p.sessionId, "session_state", {
-          running: false,
-          queued: s.queue.length,
-          queue: queueView(s),
-        });
-        if (next) this.launchPrompt(s, next.blocks, next.id, next.mentionEncoding);
       }
       return;
     }
@@ -872,7 +909,10 @@ export class SessionManager {
     if (owner?.alive && !owner.ours) throw new LockedSessionError(sessionId, owner);
     const s = this.sessions.get(sessionId);
     if (s?.deleting) throw new Error(`session ${sessionId} is being deleted`);
-    if (s) s.deleting = true;
+    if (s) {
+      s.deleting = true;
+      this.clearTurnRetry(s, false);
+    }
     let res: unknown;
     try {
       res = await this.bridge.request(METHODS.sessionDelete, { sessionId });
@@ -928,7 +968,7 @@ export class SessionManager {
     if (s.attachedGen !== this.generation) {
       throw new Error(s.attachError ?? `session ${sessionId} is not attached to the current agent`);
     }
-    if (s.running) {
+    if (s.running || s.queue.length) {
       // a stuck turn must not let the queue grow without bound — the user
       // gets an explicit error instead of a silent memory pile
       if (s.queue.length >= 50) throw new Error("prompt queue is full (50)");
@@ -943,39 +983,119 @@ export class SessionManager {
       // queueItems, so edit/drop can retract them cleanly; the real bubble
       // lands when runPrompt drains this entry (echoId = q.id).
       this.emit(sessionId, "session_state", {
-        running: true,
+        running: s.running,
         queued: s.queue.length,
         queue: queueView(s),
       });
+      if (!s.running) this.afterTurn(s);
       return { queued: true };
     }
-    this.launchPrompt(s, blocks, undefined, "uri");
-    return { queued: false };
+    return { queued: !this.launchPrompt(s, blocks, undefined, "uri") };
   }
 
   /** Every detached runPrompt call goes through here so an escaped rejection
    *  can never wedge the queue. runPrompt's own try/finally settles the turn;
    *  this catch is the last-resort guard for a throw outside that scope. */
-  private launchPrompt(s: ActiveSession, blocks: ContentBlock[], echoId?: string, mentionEncoding?: "uri") {
-    void this.runPrompt(s, blocks, echoId, mentionEncoding).catch((e) => {
+  private launchPrompt(s: ActiveSession, blocks: ContentBlock[], echoId?: string, mentionEncoding?: "uri", queueIndex = 0): boolean {
+    // This gate runs BEFORE runPrompt owns or emits anything. A blocked
+    // finalization must neither close the old region again nor recurse into
+    // afterTurn. Keep the same queue id when retrying an already parked item.
+    const backoff = (s.turnRetryAfter ?? 0) > Date.now();
+    let started = false;
+    let startError: string | undefined;
+    if (!backoff) {
+      try {
+        started = !!this.regions.beginTurn(s.sessionId);
+      } catch (error) {
+        startError = error instanceof Error ? error.message : String(error);
+        console.error(`[manager] beginTurn failed for ${s.sessionId}:`, error);
+      }
+    }
+    if (!started) {
+      if (s.queue.length >= 50 || s.queue.reduce((n, q) => n + blocksBytes(q.blocks), 0) + blocksBytes(blocks) > QUEUE_MAX_BYTES)
+        throw new Error("prompt queue is full while transcript storage is recovering");
+      s.queue.splice(Math.min(queueIndex, s.queue.length), 0, { id: echoId ?? `q-${this.runId}-${++this.queueSeq}`, blocks, mentionEncoding });
+      this.persistQueue(s);
+      if (!backoff) {
+        const firstFailure = s.turnRetryStartedAt === undefined;
+        s.turnRetryStartedAt ??= Date.now();
+        s.turnRetryDelay = Math.min((s.turnRetryDelay ?? 500) * 2, 30_000);
+        s.turnRetryAfter = Date.now() + s.turnRetryDelay;
+        if (firstFailure) this.emit(s.sessionId, "notice", { text: startError
+          ? `Could not start the turn: ${startError}. Your prompt is kept in the queue; retrying automatically.`
+          : "The previous transcript is not ready. Your prompt is kept in the queue; retrying automatically." });
+        if (!s.turnRetryWarned && Date.now() - s.turnRetryStartedAt >= 30_000) {
+          s.turnRetryWarned = true;
+          this.emit(s.sessionId, "notice", { text: "The previous transcript is still unavailable. Your prompt remains in the queue. You can retrieve it to edit or continue in a new session; automatic retries will continue." });
+        }
+      }
+      this.emit(s.sessionId, "session_state", { running: false, queued: s.queue.length, queue: queueView(s) });
+      this.scheduleTurnRetry(s);
+      return false;
+    }
+    this.clearTurnRetry(s);
+    const generation = this.generation;
+    const pending = this.runPrompt(s, blocks, echoId, mentionEncoding);
+    const owner = s.ownedRun;
+    void pending.catch((e) => {
       console.error(`[manager] runPrompt escaped rejection for ${s.sessionId}:`, e);
-      if (s.ownsTurn) {
+      if (generation === this.generation && s.ownedRun === owner && s.ownsTurn) {
         s.running = false;
         s.ownsTurn = false;
+        s.ownedRun = undefined;
         if (!s.deleted) this.emit(s.sessionId, "turn_error", { message: (e as Error).message });
         if (!s.deleted) this.afterTurn(s);
       }
     });
+    return true;
+  }
+
+  private clearTurnRetry(s: ActiveSession, reset = true) {
+    if (s.turnRetryTimer) clearTimeout(s.turnRetryTimer);
+    s.turnRetryTimer = undefined;
+    if (reset) {
+      s.turnRetryAfter = undefined;
+      s.turnRetryDelay = undefined;
+      s.turnRetryStartedAt = undefined;
+      s.turnRetryWarned = undefined;
+    }
+  }
+
+  /** Storage recovery must progress even with no browser polling. Exactly
+   * one unref'ed timer belongs to this session object and bridge generation. */
+  private scheduleTurnRetry(s: ActiveSession) {
+    if (s.turnRetryTimer || !s.queue.length || s.deleting || s.deleted || s.running ||
+        s.attachedGen !== this.generation || !s.turnRetryAfter) return;
+    const generation = this.generation;
+    s.turnRetryTimer = setTimeout(() => {
+      s.turnRetryTimer = undefined;
+      if (generation !== this.generation || this.sessions.get(s.sessionId) !== s ||
+          s.deleted || s.deleting || s.running || !s.queue.length) return;
+      try {
+        this.afterTurn(s);
+      } catch (error) {
+        // Timer callbacks have no caller to catch an unexpected start error.
+        console.error(`[manager] turn retry failed for ${s.sessionId}:`, error);
+        s.turnRetryAfter = Date.now() + 30_000;
+        this.scheduleTurnRetry(s);
+      }
+    }, Math.max(1, s.turnRetryAfter - Date.now()));
+    s.turnRetryTimer.unref?.();
   }
 
   private async runPrompt(s: ActiveSession, blocks: ContentBlock[], echoId?: string, mentionEncoding?: "uri") {
+    let completion: { type: string; data: unknown } | undefined;
+    const generation = this.generation;
+    const owner = Symbol("prompt");
+    s.ownedRun = owner;
+    const owns = () => this.generation === generation && this.sessions.get(s.sessionId) === s &&
+      s.ownedRun === owner && !s.deleted;
     try {
       s.running = true;
       s.ownsTurn = true;
       // the turn IS the provisional boundary — a fresh assembler + a durable
       // watermark frozen at this instant. The echo below is the turn's first
       // item and lands inside the region.
-      this.regions.beginTurn(s.sessionId);
       this.emit(s.sessionId, "session_state", {
         running: true,
         queued: s.queue.length,
@@ -992,21 +1112,27 @@ export class SessionManager {
         { sessionId: s.sessionId, prompt: blocks },
         { timeoutMs: 0 }, // a turn can legitimately run for hours — no ceiling
       );
-      if (!s.deleted) this.emit(s.sessionId, "turn_end", res ?? {});
+      completion = { type: "turn_end", data: res ?? {} };
     } catch (e) {
-      if (!s.deleted) this.emit(s.sessionId, "turn_error", { message: (e as Error).message });
+      completion = { type: "turn_error", data: { message: (e as Error).message } };
     } finally {
       // a send-now steer may be running a turn this process never owned —
       // hold running until the last steer settles; its settle re-enters
       // here through afterTurn
-      s.running = (s.steerInFlight ?? 0) > 0;
+      if (!owns()) return;
+      const daemonBusy = this.bridge.socketMode ? await this.daemonStillBusy(s) : false;
+      if (!owns()) return;
+      s.running = s.attachedGen === this.generation && (daemonBusy || (s.steerInFlight ?? 0) > 0);
+      if (!s.running && !s.deleted && completion) this.emit(s.sessionId, completion.type, completion.data);
       s.ownsTurn = false;
+      s.ownedRun = undefined;
       if (!s.deleted) this.afterTurn(s);
     }
   }
 
   /** Queue drain + state stamp after a locally owned turn. */
   private afterTurn(s: ActiveSession) {
+    if (s.deleted || this.sessions.get(s.sessionId) !== s) return;
     // the agent died under this turn: onExit bumped the generation before
     // this continuation ran. The queue belongs to the NEXT generation —
     // shifting here would fire every parked prompt at a dead bridge (one
@@ -1014,7 +1140,8 @@ export class SessionManager {
     // the session is re-loaded.
     // while a steer is in flight the turn may not actually be over —
     // draining now would fire parked prompts into it instead of after it
-    const next = !s.deleting && !s.steerInFlight && s.attachedGen === this.generation
+    const next = !s.deleting && !s.running && !s.steerInFlight && s.attachedGen === this.generation &&
+      (s.turnRetryAfter ?? 0) <= Date.now()
       ? s.queue.shift()
       : undefined;
     if (next) this.persistQueue(s);
@@ -1026,6 +1153,7 @@ export class SessionManager {
     // the transcript just gained nodes — refresh the sidebar's updatedAt
     this.broadcastGlobal({ type: "sessions_changed", data: {} });
     if (next) this.launchPrompt(s, next.blocks, next.id, next.mentionEncoding);
+    else this.scheduleTurnRetry(s);
   }
 
   cancel(sessionId: string, opts?: { clearQueue?: boolean }) {
@@ -1035,6 +1163,7 @@ export class SessionManager {
     for (const pr of this.pendingFor(sessionId)) this.cancelRequest(pr.requestId);
     const s = this.sessions.get(sessionId);
     if (s && opts?.clearQueue && s.queue.length) {
+      this.clearTurnRetry(s);
       s.queue.length = 0;
       this.persistQueue(s);
       this.emit(sessionId, "session_state", {
@@ -1075,19 +1204,23 @@ export class SessionManager {
         echoId: item.id,
       });
       let resolved = false;
+      const generation = this.generation;
+      const current = () => generation === this.generation && this.sessions.get(sessionId) === s && !s.deleted;
       void this.bridge
         .request(METHODS.sessionPrompt, { sessionId, prompt: item.blocks }, { timeoutMs: 0 })
         .then((res) => {
+          if (!current()) return;
           resolved = true;
           // an unmerged steer ran a turn of its own — close it like a
           // runPrompt response would. Skip while a runPrompt turn is still
           // live (its own response closes it) or the region already ended
           // (a merged steer's turn_end already fired) — turnOpen separates
           // the two.
-          if (!s.ownsTurn && !s.deleted && this.regions.turnOpen(sessionId))
+          if (!this.bridge.socketMode && !s.ownsTurn && !s.deleted && this.regions.turnOpen(sessionId))
             this.emit(sessionId, "turn_end", res ?? {});
         })
         .catch(() => {
+          if (this.sessions.get(sessionId) !== s || s.deleted) return;
           // never reached the agent — put the entry back where it was
           s.queue.splice(Math.min(index, s.queue.length), 0, item);
           if (!s.deleted) {
@@ -1102,19 +1235,23 @@ export class SessionManager {
             });
           }
         })
-        .finally(() => {
+        .finally(async () => {
+          if (!current()) return;
           s.steerInFlight = (s.steerInFlight ?? 1) - 1;
           if (s.steerInFlight || s.ownsTurn || s.deleted || !s.running) return;
           // resolved: the steered turn is over, drop the held flag. rejected:
           // the steer never ran — drop only if a real turn end was deferred
           // while steering; otherwise an adopted turn may still be live and
           // the daemon's own turn_end will land to clear it.
-          if (resolved || s.steerSawTurnEnd) {
+          if (this.bridge.socketMode) {
+            await this.finishAdoptedTurn(s);
+          } else if (resolved || s.steerSawTurnEnd) {
             s.steerSawTurnEnd = false;
             s.running = false;
             this.afterTurn(s);
           }
-        });
+        })
+        .catch((e) => console.error("[manager] send-now completion:", e));
       return { sent: true };
     }
     if (s.attachedGen === this.generation) {
@@ -1125,8 +1262,7 @@ export class SessionManager {
         queued: s.queue.length,
         queue: queueView(s),
       });
-      this.launchPrompt(s, item.blocks, item.id, item.mentionEncoding);
-      return { sent: true };
+      return { sent: this.launchPrompt(s, item.blocks, item.id, item.mentionEncoding, index) };
     }
     // dead bridge generation — park the entry again rather than dropping it
     s.queue.splice(Math.min(index, s.queue.length), 0, item);
@@ -1141,6 +1277,7 @@ export class SessionManager {
     const index = s ? s.queue.findIndex((q) => q.id === id) : -1;
     if (!s || index < 0) return null;
     const [item] = s.queue.splice(index, 1);
+    if (!s.queue.length) this.clearTurnRetry(s);
     this.persistQueue(s);
     this.emit(sessionId, "session_state", {
       running: s.running,

@@ -37,7 +37,11 @@ interface FileCand {
  *  (object URLs die with the page). */
 const SNIP = "snip:";
 
-const parkedAttachments = new Map<string, { images: ImageAtt[]; mentions: { path: string; name: string }[] }>();
+type DraftRecovery = { text: string; images: ImageAtt[]; mentions: { path: string; name: string }[] };
+const parkedAttachments = new Map<string, { text?: string; images: ImageAtt[]; mentions: { path: string; name: string }[] }>();
+// A request can outlive its composer. Route recovery to the currently mounted
+// composer for that session, or park it for the next mount.
+const activeComposers = new Map<string, (draft: DraftRecovery) => void>();
 
 function autosize(el: HTMLTextAreaElement) {
   el.style.height = "auto";
@@ -88,7 +92,8 @@ export default function ChatInput({
     mentionsRef.current = mentions;
   });
   // prompt history (↑ cycles); histIdx -1 = not navigating
-  const [history, setHistory] = useState<string[]>([]);
+  const [historyBox, setHistory] = useState<{ sid: string; prompts: string[] }>({ sid: sessionId, prompts: [] });
+  const history = historyBox.sid === sessionId ? historyBox.prompts : [];
   const histIdx = useRef(-1);
   const histDraft = useRef("");
   // touch devices have no Shift+Enter — Enter inserts a newline, send is the button
@@ -100,9 +105,11 @@ export default function ChatInput({
   useEffect(() => {
     histIdx.current = -1;
     histDraft.current = "";
-    api<{ prompts: string[] }>(`/api/sessions/${sessionId}/history`)
-      .then((r) => setHistory(r.prompts))
-      .catch(() => setHistory([]));
+    const controller = new AbortController();
+    api<{ prompts: string[] }>(`/api/sessions/${sessionId}/history`, { signal: controller.signal })
+      .then((r) => { if (!controller.signal.aborted) setHistory({ sid: sessionId, prompts: r.prompts }); })
+      .catch(() => { if (!controller.signal.aborted) setHistory({ sid: sessionId, prompts: [] }); });
+    return () => controller.abort();
   }, [sessionId]);
 
   // per-session draft persistence. On a switch, the outgoing session's text
@@ -123,20 +130,32 @@ export default function ChatInput({
       } else parkedAttachments.delete(prev);
     }
     prevSession.current = sessionId;
-    const parked = parkedAttachments.get(sessionId);
-    parkedAttachments.delete(sessionId);
+    let cancelled = false;
+    const recover = (draft: DraftRecovery) => {
+      setText((current) => mergeDraftText(current, draft.text));
+      setImages((current) => [...current, ...draft.images]);
+      setMentions((current) => [...current, ...draft.mentions]);
+    };
     queueMicrotask(() => {
+      if (cancelled) return;
+      const parked = parkedAttachments.get(sessionId);
+      parkedAttachments.delete(sessionId);
       let stored = "";
       try {
         stored = localStorage.getItem(draftKey) ?? "";
       } catch {
         /* storage denied */
       }
-      setText(stored);
+      setText(parked?.text ?? stored);
       setImages(parked?.images ?? []);
       setMentions(parked?.mentions ?? []);
       setPalette(null);
+      activeComposers.set(sessionId, recover);
     });
+    return () => {
+      cancelled = true;
+      if (activeComposers.get(sessionId) === recover) activeComposers.delete(sessionId);
+    };
   }, [draftKey, sessionId]);
 
   // previews are object URLs — release them when the composer unmounts.
@@ -341,16 +360,32 @@ export default function ChatInput({
     histIdx.current = -1;
     try {
       await sendPrompt(sessionId, t, imgs.length ? imgs : undefined, kept.length ? kept : undefined);
-      setHistory((h) => [t, ...h]);
+      if (prevSession.current === sessionId) setHistory((h) => ({ sid: sessionId, prompts: [t, ...(h.sid === sessionId ? h.prompts : [])] }));
       for (const i of prevImages) URL.revokeObjectURL(i.preview);
     } catch (e) {
-      // restore everything the user composed, and say why it failed
-      setText(t);
-      setImages(prevImages);
-      setMentions(prevMentions);
+      // The user may already have composed another prompt or switched
+      // sessions while this request was pending. Recover into its origin,
+      // appending to newer work and keeping both sets of preview URLs alive.
+      const recover = activeComposers.get(sessionId);
+      if (recover) recover({ text: t, images: prevImages, mentions: prevMentions });
+      else {
+        const parked = parkedAttachments.get(sessionId);
+        let current = parked?.text ?? "";
+        try {
+          current ||= localStorage.getItem(draftKey) ?? "";
+          localStorage.setItem(draftKey, mergeDraftText(current, t));
+        } catch {
+          /* tab-local recovery below also works when storage is denied */
+        }
+        parkedAttachments.set(sessionId, {
+          text: mergeDraftText(current, t),
+          images: [...(parked?.images ?? []), ...prevImages],
+          mentions: [...(parked?.mentions ?? []), ...prevMentions],
+        });
+      }
       toast(`Send failed: ${(e as Error).message}`);
     }
-  }, [text, images, mentions, canSend, sessionId, cwd, toast]);
+  }, [text, images, mentions, canSend, sessionId, draftKey, cwd, toast]);
 
   const addImage = useCallback(async (f: File) => {
     // mirror the server caps (lib/limits.ts) — fail early with a toast

@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   changedFiles, COMMIT_TIMEOUT_MS, commitStaged, filePatch, isSafeRelPath, parseNumstatZ,
   parsePorcelainZ, revertFile, stageFile, unstageFile,
@@ -31,7 +31,7 @@ function repo(commit: boolean) {
 describe("parsers", () => {
   it("parsePorcelainZ handles renames and spaces", () => {
     expect(parsePorcelainZ("R  new name.txt\0old.txt\0?? a b.txt\0 M x\0")).toEqual([
-      { path: "new name.txt", status: "R", staged: true, unstaged: false },
+      { path: "new name.txt", originalPath: "old.txt", status: "R", staged: true, unstaged: false },
       { path: "a b.txt", status: "??", staged: false, unstaged: true },
       { path: "x", status: "M", staged: false, unstaged: true },
     ]);
@@ -55,6 +55,37 @@ describe("parsers", () => {
 });
 
 describe("changedFiles / filePatch", () => {
+  it("discards only the requested repository despite inherited Git locator variables", async () => {
+    const a = repo(true), b = repo(true);
+    writeFileSync(join(a.d, "base.txt"), "requested edit\n");
+    writeFileSync(join(b.d, "base.txt"), "unrelated edit\n");
+    vi.stubEnv("GIT_DIR", join(b.d, ".git"));
+    vi.stubEnv("GIT_WORK_TREE", b.d);
+    vi.stubEnv("GIT_INDEX_FILE", join(b.d, ".git/index"));
+    try { await revertFile(a.d, "base.txt"); }
+    finally { vi.unstubAllEnvs(); }
+    expect(readFileSync(join(a.d, "base.txt"), "utf8")).toBe("one\n");
+    expect(readFileSync(join(b.d, "base.txt"), "utf8")).toBe("unrelated edit\n");
+  });
+
+  it("reverts both paths of a staged rename without leaving a staged deletion", async () => {
+    const { d, g } = repo(true);
+    g("mv", "base.txt", "한글 [new].txt");
+    writeFileSync(join(d, "한글 [new].txt"), "one\nedit\n");
+    await revertFile(d, "한글 [new].txt");
+    expect(g("status", "--porcelain").toString()).toBe("");
+    expect(readFileSync(join(d, "base.txt"), "utf8")).toBe("one\n");
+    expect(existsSync(join(d, "한글 [new].txt"))).toBe(false);
+  });
+
+  it("unstages both rename paths while preserving the worktree content", async () => {
+    const { d, g } = repo(true);
+    g("mv", "base.txt", "new name.txt");
+    await unstageFile(d, "new name.txt");
+    expect(g("diff", "--cached", "--name-only").toString()).toBe("");
+    expect(readFileSync(join(d, "new name.txt"), "utf8")).toBe("one\n");
+    expect(existsSync(join(d, "base.txt"))).toBe(false);
+  });
   it("lists Korean file names verbatim and diffs them", async () => {
     const { d, g } = repo(true);
     writeFileSync(join(d, "한글 파일.txt"), "안녕\n");

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Maximize2, Pencil, Pin, PinOff, Plus, RefreshCw, X } from "lucide-react";
 import { api } from "@/lib/client/api";
 import { connId, onServerRestart, sendTerminalInput, streamSub } from "@/lib/client/stream";
@@ -50,7 +50,13 @@ interface Props {
   discovered?: string[];
 }
 
-export default function TerminalPanel({ sessionId, cwd, discovered = [] }: Props) {
+export default function TerminalPanel(props: Props) {
+  // Session changes destroy the old view in the same commit, before any new
+  // list request completes. Terminal ids and input handlers belong to this key.
+  return <SessionTerminalPanel key={props.sessionId} {...props} />;
+}
+
+function SessionTerminalPanel({ sessionId, cwd, discovered = [] }: Props) {
   const toast = useToast();
   const [info, setInfo] = useState<Map<string, TerminalInfo>>(new Map());
   const [active, setActive] = useState<string | null>(null);
@@ -58,14 +64,27 @@ export default function TerminalPanel({ sessionId, cwd, discovered = [] }: Props
    *  list their ids */
   const [closed, setClosed] = useState<Set<string>>(() => new Set());
 
+  const lifetime = useRef<AbortController | null>(null);
+  const refreshSeq = useRef(0);
+  useLayoutEffect(() => {
+    const controller = new AbortController();
+    lifetime.current = controller;
+    return () => controller.abort();
+  }, []);
+
   // server-authoritative tab list — survives reloads; `user`/`tombstone`
   // flags distinguish my shells from agent terminals and released ones.
   const refresh = useCallback(async () => {
+    const signal = lifetime.current?.signal;
+    if (!signal || signal.aborted) return;
+    const seq = ++refreshSeq.current;
     try {
       const r = await api<{ terminals: TerminalInfo[] }>(
         `/api/terminals?sessionId=${encodeURIComponent(sessionId)}`,
+        { signal },
       );
-      setInfo(new Map(r.terminals.map((t) => [t.id, t])));
+      if (signal.aborted || seq !== refreshSeq.current) return;
+      setInfo(new Map(r.terminals.filter((t) => t.sessionId === sessionId).map((t) => [t.id, t])));
     } catch {
       /* keep stale */
     }
@@ -90,14 +109,18 @@ export default function TerminalPanel({ sessionId, cwd, discovered = [] }: Props
   if ((!active || !all.includes(active)) && all.length) setActive(all[all.length - 1]);
 
   const spawn = async () => {
+    const signal = lifetime.current?.signal;
+    if (!signal || signal.aborted) return;
     try {
       const r = await api<{ terminalId: string }>("/api/terminals", {
         method: "POST",
         body: JSON.stringify({ cwd, sessionId }),
       });
+      if (signal.aborted) return;
       setActive(r.terminalId);
       void refresh();
     } catch (e) {
+      if (signal.aborted) return;
       toast(`New shell failed: ${(e as Error).message}`);
     }
   };
@@ -109,10 +132,13 @@ export default function TerminalPanel({ sessionId, cwd, discovered = [] }: Props
   };
 
   const setKeep = async (id: string, keep: boolean) => {
+    const signal = lifetime.current?.signal;
+    if (!signal || signal.aborted) return;
     try {
       await api(`/api/terminals/${id}`, { method: "PATCH", body: JSON.stringify({ keep }) });
       void refresh();
     } catch (e) {
+      if (signal.aborted) return;
       toast(`Couldn't ${keep ? "pin" : "unpin"} the shell: ${(e as Error).message}`);
     }
   };
@@ -204,7 +230,7 @@ function TerminalView({ terminalId, onEvent }: { terminalId: string; onEvent?: (
     setCtrl(ctrlRef.current);
   };
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     let disposed = false;
     let unsub: (() => void) | null = null;
     let disposeTerm: (() => void) | null = null;
@@ -235,6 +261,7 @@ function TerminalView({ terminalId, onEvent }: { terminalId: string; onEvent?: (
       opened = term;
       fit.fit();
       const sendResize = (cols: number, rows: number, claim = false) => {
+        if (disposed) return;
         void api(`/api/terminals/${terminalId}/resize`, {
           method: "POST",
           // connId → only the oldest attached viewer actually resizes the PTY
@@ -281,6 +308,7 @@ function TerminalView({ terminalId, onEvent }: { terminalId: string; onEvent?: (
         }
       });
       term.onData((data) => {
+        if (disposed) return;
         // sticky Ctrl turns the next letter into its control character
         if (ctrlRef.current && data.length === 1) {
           const c = data.toLowerCase().charCodeAt(0);

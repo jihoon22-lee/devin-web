@@ -76,6 +76,9 @@ export interface SessionState {
    *  running turn's provisional region and are dropped until the server
    *  advances it (they would double-render and sink thoughts beneath). */
   durableThrough?: number;
+  /** Transcript delivery acknowledged through this raw node cursor. A view
+   * watermark may advance before the separately transported rows arrive. */
+  durableScannedThrough?: number;
   /** durable rows present ABOVE the watermark while a provisional region
    *  is live — the one residual that strands the running turn's items below
    *  newer content in the two-region model. Correct code can never produce
@@ -287,6 +290,7 @@ export function applyViewFrame(state: SessionState, f: ViewFrame): "ok" | "gap" 
     next.provisional = mapStable(state.provisional, f.provisional, provToChatItem);
     next.retained = mapStable(state.retained, f.retained, retainedToChatItem);
     next.durableThrough = f.durableThrough;
+    next.durableScannedThrough = f.durableThrough;
     next.sunkLive = undefined;
     next.v = f.v;
     noteWatermarkViolation(next);

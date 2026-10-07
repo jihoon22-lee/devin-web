@@ -687,6 +687,38 @@ describe("surviving global outbox", () => {
 });
 
 describe("transcript delta fan-out", () => {
+  it("delivers and replays a filtered-row completion cursor instead of silently advancing it", async () => {
+    const sid = "s-filtered-completion";
+    const { pokeSessionsDb } = await import("../lib/transcriptWatch");
+    const { DatabaseSync } = await import("node:sqlite");
+    const c = conn();
+    const first = collect();
+    try {
+      attachStream(c, 0, first.send);
+      subscribe(c, [{ kind: "transcript", id: sid }]);
+      const before = first.msgs.at(-1)?.n ?? 0;
+      const db = new DatabaseSync(join(stateDir, "sessions.db"));
+      try {
+        db.prepare("INSERT INTO message_nodes (session_id,node_id,parent_node_id,chat_message,created_at) VALUES (?,1,NULL,?,?)")
+          .run(sid, JSON.stringify({ role: "system", content: "filtered system row" }), 1_700_000_000);
+      } finally { db.close(); }
+      pokeSessionsDb();
+      await new Promise(r => setTimeout(r, 150));
+      expect(first.msgs.filter(m => m.kind === "transcript")).toEqual([
+        expect.objectContaining({ items: [], lastId: 1 }),
+      ]);
+      detachStream(c, first.send);
+      const again = collect();
+      attachStream(c, before, again.send);
+      expect(again.msgs.filter(m => m.kind === "transcript")).toEqual([
+        expect.objectContaining({ items: [], lastId: 1 }),
+      ]);
+    } finally {
+      unsubscribe(c, [{ kind: "transcript", id: sid }]);
+      detachStream(c);
+    }
+  });
+
   it("shares one sessions.db handle per commit across subscribers", async () => {
     const sid = "s-fanout";
     const dbMod = await import("../lib/db");

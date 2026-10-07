@@ -1,9 +1,10 @@
 // Playwright owns this process. All children receive an allowlisted environment;
 // teardown also runs when the fixture, production build, or startup fails.
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { stopFixtureDaemon } from "./cleanup-daemon.mjs";
 import { fixtureEnvironment, fixturePaths } from "./environment.mjs";
 
 const repository = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -42,25 +43,6 @@ function reapHolder() {
         variables.includes(`DEVIN_WEB_STATE_DIR=${fixture.state}`)) process.kill(pid, "SIGKILL");
   } catch { /* absent or identity changed */ }
 }
-function stopDaemon() {
-  // ctl owns detached process groups. Never pass a stale/recycled fixture PID
-  // to it: each live PID must still carry this fixture's unique state directory.
-  for (const name of ["pid", "acpd.pid", "web-watch.pid", "acpd-idle-restart.pid"]) {
-    const file = join(fixture.state, name);
-    if (!existsSync(file)) continue;
-    const pid = Number(readFileSync(file, "utf8"));
-    let owned = false;
-    try { owned = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(`DEVIN_WEB_STATE_DIR=${fixture.state}`); } catch { /* exited */ }
-    if (!owned) rmSync(file, { force: true });
-  }
-  return new Promise((resolve) => {
-    const cleanup = spawn(join(repository, "bin/devin-web-ctl"), ["stop", "--all"], {
-      cwd: repository, env, stdio: "inherit",
-    });
-    cleanup.once("error", resolve);
-    cleanup.once("exit", resolve);
-  });
-}
 
 try {
   // A stopped prior run must not leave its fake lock holder orphaned.
@@ -81,7 +63,10 @@ try {
   if (!stopping) { console.error(error); process.exitCode = 1; }
 } finally {
   stopChild();
-  if (daemonStarted) await stopDaemon();
-  reapHolder();
+  try {
+    if (daemonStarted) await stopFixtureDaemon(fixture, env);
+  } finally {
+    reapHolder();
+  }
   rmSync(fixture.root, { recursive: true, force: true });
 }

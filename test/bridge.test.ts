@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { AcpBridge } from "../lib/acp/bridge";
 
 const MISSING = "definitely-not-a-devin-binary";
@@ -180,5 +180,67 @@ describe("daemon request identity", () => {
     dispatch(identity); request("9"); request(9, "other"); request(9); request(9);
     dispatch(identity); request(9); // replay supplies the same identity again
     expect(events.map((event) => event.requestId)).toEqual([undefined, undefined, id, undefined, id]);
+  });
+});
+
+
+describe("local RPC reply ownership", () => {
+  it("ignores requests arriving on a superseded transport", async () => {
+    const { EventEmitter } = await import("node:events");
+    const { PassThrough } = await import("node:stream");
+    const transport = () => {
+      const proc = Object.assign(new EventEmitter(), {
+        pid: 123, exitCode: null, stdout: new PassThrough(), stdin: new PassThrough(), stderr: new PassThrough(),
+        kill: () => { proc.emit("exit", 0, null); },
+      });
+      proc.stdin.on("data", (data: Buffer) => {
+        const msg = JSON.parse(data.toString());
+        if (msg.method === "initialize") queueMicrotask(() => proc.stdout.write(JSON.stringify({ id: msg.id, result: { protocolVersion: 1 } }) + "\n"));
+      });
+      return proc;
+    };
+    const first = transport(), next = transport();
+    const events: import("../lib/acp/bridge").ClientRequestEvent[] = [];
+    let connectorCalls = 0;
+    const b = new AcpBridge({ onSessionUpdate() {}, onNotification() {}, onExit() {}, onClientRequest: (event) => events.push(event) },
+      [], "fake", 1000, async () => connectorCalls++ ? next : first);
+    try {
+      await b.ensure();
+      b.kill();
+      await b.ensure();
+      const wire = JSON.stringify({ id: 9, method: "session/request_permission", params: { sessionId: "s" } }) + "\n";
+      first.stdout.write(wire);
+      expect(events).toEqual([]);
+      next.stdout.write(wire);
+      expect(events).toHaveLength(1);
+    } finally { b.kill(); }
+  });
+
+  it.each([false, true])("drops delayed local success/error after transport replacement (error: %s)", async (failed) => {
+    const { PassThrough } = await import("node:stream");
+    const { b } = bridgeWithExits();
+    // Deferred local IO controls the race; real writable transports record delivery.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const internal = b as any;
+    const original = { stdin: new PassThrough() };
+    const replacement = { stdin: new PassThrough() };
+    const oldReplies: Buffer[] = [], newReplies: Buffer[] = [];
+    original.stdin.on("data", (data: Buffer) => oldReplies.push(data));
+    replacement.stdin.on("data", (data: Buffer) => newReplies.push(data));
+    let resolve!: (value: unknown) => void;
+    let reject!: (reason: Error) => void;
+    vi.spyOn(internal, "serveLocally").mockImplementation(() => new Promise((yes, no) => { resolve = yes; reject = no; }));
+    internal.proc = original;
+    internal.dispatch({ id: 1, method: "fs/read_text_file", params: {} });
+    internal.proc = replacement;
+    if (failed) reject(new Error("old IO failed")); else resolve({ content: "old bytes" });
+    await new Promise((r) => setImmediate(r));
+    expect(newReplies).toEqual([]);
+    expect(oldReplies).toEqual([]);
+    // A new request with the same RPC id still receives its own result.
+    internal.dispatch({ id: 1, method: "fs/read_text_file", params: {} });
+    resolve({ content: "new bytes" });
+    await new Promise((r) => setImmediate(r));
+    expect(JSON.parse(Buffer.concat(newReplies).toString())).toMatchObject({ id: 1, result: { content: "new bytes" } });
   });
 });

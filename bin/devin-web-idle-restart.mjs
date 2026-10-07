@@ -10,9 +10,10 @@
 // ADOPTED as the client on first data and would displace the live web
 // bridge, so `_devin-web/shim_state` is used ONLY while the web is down
 // (no web → no live client → nothing to displace).
+import { writeProcessIdentity, removeProcessIdentity, processOwnership } from "./process-identity.mjs";
 import { stateDir } from "../lib/paths.mjs";
 import { connect } from "node:net";
-import { appendFileSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,7 +21,7 @@ import { fileURLToPath } from "node:url";
 const STATE = stateDir();
 const PORT = process.env.DEVIN_WEB_PORT || "7100";
 const SOCK = process.env.DEVIN_WEB_ACP_SOCK || join(STATE, "acp.sock");
-const ACPD_PIDFILE = join(STATE, "acpd.pid");
+const ACPD_PIDFILE = process.env.DEVIN_WEB_ACPD_PIDFILE ?? join(STATE, "acpd.pid");
 const MY_PIDFILE = join(STATE, "acpd-idle-restart.pid");
 const LOG = join(STATE, "acpd-watch.log");
 // daemon's own status file (lib/acp/daemon.mjs writeStatus) — sits next to
@@ -38,17 +39,15 @@ const log = (m) => {
   try { appendFileSync(LOG, `[${new Date().toISOString()}] idle-restart: ${m}\n`); } catch {}
 };
 
+let identity;
 const cleanup = (code) => {
-  try { rmSync(MY_PIDFILE); } catch {}
+  if (identity) removeProcessIdentity(MY_PIDFILE, identity);
   process.exit(code);
 };
 
-const startPid = (() => {
-  try { return Number(readFileSync(ACPD_PIDFILE, "utf8").trim()); } catch { return null; }
-})();
-const currentAcpdPid = () => {
-  try { return Number(readFileSync(ACPD_PIDFILE, "utf8").trim()); } catch { return null; }
-};
+const currentAcpdIdentity = () => processOwnership(ACPD_PIDFILE, "acpd");
+const startIdentity = currentAcpdIdentity();
+const startPid = startIdentity.record?.pid;
 
 const deadline = Date.now() + MAX_WAIT_MS;
 let idlePolls = 0;
@@ -133,8 +132,8 @@ function shimBusy() {
 }
 
 async function tick() {
-  const now = currentAcpdPid();
-  if (startPid != null && now != null && now !== startPid) {
+  const now = currentAcpdIdentity();
+  if (startIdentity.status !== "owned" || now.status !== "owned" || JSON.stringify(now.record) !== JSON.stringify(startIdentity.record)) {
     log(`acpd pid changed ${startPid} → ${now} — restarted by someone else; done`);
     return cleanup(0);
   }
@@ -170,7 +169,7 @@ async function tick() {
 }
 
 function main() {
-  try { writeFileSync(MY_PIDFILE, String(process.pid)); } catch {}
+  identity = writeProcessIdentity(MY_PIDFILE, "idle");
   log(`watching for an idle gap to restart acpd (was pid ${startPid ?? "?"})`);
   tick();
 }

@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const stateDir = mkdtempSync(join(tmpdir(), "dw-mgr-state-"));
 process.env.DEVIN_WEB_STATE_DIR = stateDir;
@@ -760,14 +760,14 @@ describe("rename / delete / queue hardening (D5, D7, D8)", () => {
     await expect(m.prompt("s1", [{ type: "text", text: "over" }])).rejects.toThrow("queue is full");
   });
 
-  it("rejects queueing once the session's queued bytes pass QUEUE_MAX_BYTES", async () => {
+  it.each([true, false])("rejects queueing once queued bytes pass QUEUE_MAX_BYTES (running: %s)", async (running) => {
     const m = stubbed();
     loaded(m, "s-bytes");
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (m.bridge as any).request = () => new Promise(() => {}); // turn never ends
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const s = (m as any).sessions.get("s-bytes");
-    s.running = true;
+    s.running = running;
     // a parked entry already over the byte cap refuses even a text prompt —
     // inline base64 payloads, not entry count, are what pin memory
     s.queue.push({
@@ -922,6 +922,7 @@ describe("subscription bookkeeping", () => {
 });
 
 describe("provisional region (two-region transcript)", () => {
+  beforeEach(async () => { (await import("../lib/itemLog")).itemLogForget("s1"); });
   const openSession = async (m: SessionManager, sid = "s1") => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const mi = m as any;
@@ -1507,4 +1508,311 @@ describe("deleteSession lock guard", () => {
     loaded(m, "s-free");
     await expect(m.deleteSession("s-free")).resolves.toBeTruthy();
   });
+});
+
+
+describe("adopted concurrent prompt completion", () => {
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  it.each([true, false])("holds persisted queue until daemon idle (count protocol: %s)", async (counted) => {
+    const m = stubbed();
+    const mi = m as any;
+    const sessionId = `concurrent-${counted}`;
+    mi.testDurable.set(sessionId, 100);
+    let busy = true;
+    vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+    vi.spyOn(m.bridge, "daemonState").mockImplementation(async () => ({ gen: 1,
+      sessions: [{ sessionId, cwd: "/tmp", loadResult: {}, busy }] }));
+    const sent: string[] = [];
+    mi.bridge.request = (method: string, params: any) => {
+      if (method === METHODS.sessionPrompt) { sent.push(params.prompt[0].text); return new Promise(() => {}); }
+      return Promise.resolve({});
+    };
+    await m.loadSession(sessionId, "/tmp");
+    await m.prompt(sessionId, [{ type: "text", text: "parked" }] as never);
+    mi.emit(sessionId, "session_update", { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "still working" } });
+    mi.onNotification("_devin-web/turn_end", { sessionId, ...(counted ? { remainingPrompts: 1 } : {}) });
+    await new Promise((r) => setImmediate(r));
+    expect(sent).toEqual([]);
+    expect(m.getSession(sessionId)?.running).toBe(true);
+    expect(mi.regions.turnOpen(sessionId)).toBe(true);
+    // The completed adopted turn has committed its transcript before idle.
+    mi.testDurable.set(sessionId, 110);
+    busy = false;
+    mi.onNotification("_devin-web/turn_end", { sessionId, ...(counted ? { remainingPrompts: 0 } : {}) });
+    await new Promise((r) => setImmediate(r));
+    expect(sent).toEqual(["parked"]);
+  });
+
+  it.each([false, true])("settling a local steer cannot close the adopted original (failure: %s)", async (failed) => {
+    const m = stubbed(), mi = m as any;
+    const sessionId = `adopt-steer-${failed}`;
+    let busy = true;
+    vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+    vi.spyOn(m.bridge, "daemonState").mockImplementation(async () => ({ gen: 1,
+      sessions: [{ sessionId, cwd: "/tmp", loadResult: {}, busy }] }));
+    let resolve!: (value: unknown) => void, reject!: (error: Error) => void;
+    const prompts: string[] = [];
+    mi.bridge.request = (method: string, params: any) => {
+      if (method !== METHODS.sessionPrompt) return Promise.resolve({});
+      prompts.push(params.prompt[0].text);
+      return new Promise((yes, no) => { resolve = yes; reject = no; });
+    };
+    await m.loadSession(sessionId, "/tmp");
+    await m.prompt(sessionId, [{ type: "text", text: "steer" }] as never);
+    const id = mi.sessions.get(sessionId).queue[0].id;
+    await m.prompt(sessionId, [{ type: "text", text: "after" }] as never);
+    m.sendQueuedNow(sessionId, id);
+    if (failed) reject(new Error("steer failed")); else resolve({});
+    await new Promise((r) => setImmediate(r));
+    expect(prompts).toEqual(["steer"]);
+    expect(m.getSession(sessionId)?.running).toBe(true);
+    expect(mi.regions.turnOpen(sessionId)).toBe(true);
+    busy = false;
+    mi.onNotification("_devin-web/turn_end", { sessionId, remainingPrompts: 0 });
+    await new Promise((r) => setImmediate(r));
+    expect(prompts).toEqual(["steer", failed ? "steer" : "after"]);
+  });
+
+  it.each([false, true])("reconciles an unconfirmed completion on reconnect without draining a busy turn (legacy: %s)", async (legacy) => {
+    const m = new SessionManager(), mi = m as any;
+    const sessionId = `reconcile-idle-${legacy}`;
+    vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+    vi.spyOn(m.bridge, "ensure").mockResolvedValue({} as never);
+    let state: Awaited<ReturnType<typeof m.bridge.daemonState>> = null;
+    vi.spyOn(m.bridge, "daemonState").mockImplementation(async () => state);
+    const sent: string[] = [];
+    mi.bridge.request = (method: string, params: any) => {
+      if (method === METHODS.sessionPrompt) { sent.push(params.prompt[0].text); return new Promise(() => {}); }
+      return Promise.resolve({});
+    };
+    mi.sessions.set(sessionId, { sessionId, cwd: "/tmp", loaded: true, running: true,
+      attachedGen: mi.generation, queue: [{ id: "q-reconcile", blocks: [{ type: "text", text: "later" }] }] });
+    mi.onNotification("_devin-web/turn_end", { sessionId, ...(legacy ? {} : { remainingPrompts: 0 }) });
+    await new Promise((r) => setImmediate(r));
+    expect(sent).toEqual([]);
+    await m.ensure(); // unavailable stays conservative across reconnect
+    expect(sent).toEqual([]);
+    state = { gen: 1, sessions: [{ sessionId, cwd: "/tmp", loadResult: {}, busy: true }] };
+    await m.ensure();
+    expect(sent).toEqual([]);
+    state.sessions[0].busy = false;
+    await m.ensure();
+    expect(sent).toEqual(["later"]);
+    await m.ensure();
+    expect(sent).toEqual(["later"]); // locally owned new turn is never closed by a stale idle snapshot
+    mi.dbSub?.();
+  });
+
+  it("does not mistake an unavailable legacy daemon query for idle", async () => {
+    const m = stubbed(), mi = m as any;
+    vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+    vi.spyOn(m.bridge, "daemonState").mockResolvedValue(null);
+    mi.sessions.set("unknown", { sessionId: "unknown", cwd: "/tmp", loaded: true, running: true, attachedGen: mi.generation, queue: [] });
+    mi.onNotification("_devin-web/turn_end", { sessionId: "unknown" });
+    await new Promise((r) => setImmediate(r));
+    expect(m.getSession("unknown")?.running).toBe(true);
+  });
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+});
+
+describe("review: prompt completion generation ownership", () => {
+  it("an old daemon-state reply cannot clear ownership of a replacement generation's prompt", async () => {
+    const m = stubbed();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mi = m as any;
+    const sessionId = "review-generation";
+    const s = { sessionId, cwd: "/tmp", loaded: true, running: false, attachedGen: 0, queue: [] };
+    mi.sessions.set(sessionId, s);
+    vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+    let completeOld!: (value: unknown) => void;
+    let resolveState!: (state: unknown) => void;
+    mi.bridge.request = (method: string) => method === METHODS.sessionPrompt
+      ? new Promise((resolve) => { completeOld = resolve; }) : Promise.resolve({});
+    mi.bridge.daemonState = () => new Promise((resolve) => { resolveState = resolve; });
+    await m.prompt(sessionId, [{ type: "text", text: "old" }]);
+    completeOld({});
+    await new Promise((r) => setImmediate(r));
+    mi.bridge.handlers.onExit(null, null);
+    s.attachedGen = mi.generation; // the same session object has reattached
+    await m.prompt(sessionId, [{ type: "text", text: "replacement" }]);
+    expect(mi.sessions.get(sessionId).ownsTurn).toBe(true);
+    resolveState({ gen: 0, sessions: [{ sessionId, busy: false }] });
+    await new Promise((r) => setImmediate(r));
+    expect(mi.sessions.get(sessionId).ownsTurn).toBe(true);
+    expect(mi.sessions.get(sessionId).running).toBe(true);
+  });
+});
+
+it("a stale send-now settlement does not decrement the next generation's steer count", async () => {
+  const m = stubbed();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mi = m as any;
+  const sessionId = "review-steer-generation";
+  const s = { sessionId, cwd: "/tmp", loaded: true, running: true, attachedGen: 0,
+    queue: [{ id: "q-old", blocks: [{ type: "text", text: "old steer" }] }] };
+  mi.sessions.set(sessionId, s);
+  vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+  const settle: ((value: unknown) => void)[] = [];
+  mi.bridge.request = () => new Promise((resolve) => { settle.push(resolve); });
+  mi.bridge.daemonState = async () => ({ gen: mi.generation, sessions: [{ sessionId, busy: true }] });
+  m.sendQueuedNow(sessionId, "q-old");
+  mi.bridge.handlers.onExit(null, null);
+  s.attachedGen = mi.generation;
+  s.running = true;
+  s.queue.push({ id: "q-new", blocks: [{ type: "text", text: "new steer" }] });
+  m.sendQueuedNow(sessionId, "q-new");
+  expect(mi.sessions.get(sessionId).steerInFlight).toBe(1);
+  settle[0]({});
+  await new Promise((r) => setImmediate(r));
+  expect(mi.sessions.get(sessionId).steerInFlight).toBe(1);
+});
+
+
+it("parks prompts when the preceding region cannot finalize and drains them once after recovery", async () => {
+  const m = stubbed();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mi = m as any;
+  const sessionId = "blocked-finalization";
+  mi.sessions.set(sessionId, { sessionId, cwd: "/tmp", loaded: true, running: false, attachedGen: mi.generation, queue: [] });
+  const starts = vi.spyOn(mi.regions, "beginTurn").mockReturnValue(undefined);
+  const sent: string[] = [];
+  const complete: (() => void)[] = [];
+  mi.bridge.request = (_method: string, params: { prompt: { text: string }[] }) => {
+    sent.push(params.prompt[0].text);
+    return new Promise((resolve) => { complete.push(() => resolve({})); });
+  };
+  expect(await m.prompt(sessionId, [{ type: "text", text: "first" }])).toEqual({ queued: true });
+  expect(await m.prompt(sessionId, [{ type: "text", text: "second" }])).toEqual({ queued: true });
+  expect(sent).toEqual([]);
+  expect(m.queueState(sessionId).queue.map((q) => q.text)).toEqual(["first", "second"]);
+  expect(readAllQueues()[sessionId]).toHaveLength(2);
+  await mi.reattachStale();
+  await mi.reattachStale();
+  expect(starts).toHaveBeenCalledTimes(1); // retries back off while storage is down
+  starts.mockRestore();
+  mi.sessions.get(sessionId).turnRetryAfter = 0;
+  await mi.reattachStale();
+  await mi.reattachStale();
+  expect(sent).toEqual(["first"]);
+  complete[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(sent).toEqual(["first", "second"]);
+  complete[1]();
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(m.queueState(sessionId).queued).toBe(0);
+  mi.dbSub?.();
+});
+
+it("keeps blocked prompt limits, queue identities and idle state consistent", async () => {
+  const m = stubbed();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mi = m as any;
+  const sessionId = "blocked-limits";
+  mi.sessions.set(sessionId, { sessionId, cwd: "/tmp", loaded: true, running: false, attachedGen: mi.generation, queue: [] });
+  const starts = vi.spyOn(mi.regions, "beginTurn").mockReturnValue(undefined);
+  const run = vi.spyOn(mi, "runPrompt");
+  for (let i = 0; i < 50; i++) expect(await m.prompt(sessionId, [{ type: "text", text: `p${i}` }])).toEqual({ queued: true });
+  await expect(m.prompt(sessionId, [{ type: "text", text: "overflow" }])).rejects.toThrow(/queue is full/);
+  const queue = m.queueState(sessionId);
+  expect(queue.running).toBe(false);
+  expect(queue.queued).toBe(50);
+  expect(new Set(queue.queue.map((q) => q.id)).size).toBe(50);
+  expect(queue.queue.map((q) => q.text)).toEqual(Array.from({ length: 50 }, (_, i) => `p${i}`));
+  expect(starts).toHaveBeenCalledTimes(1);
+  expect(run).not.toHaveBeenCalled();
+  expect(readAllQueues()[sessionId].map((q) => q.id)).toEqual(queue.queue.map((q) => q.id));
+  starts.mockRestore(); run.mockRestore();
+});
+
+it("retains a failed SQLite turn while holding the next queued prompt, then recovers both once", async () => {
+  const { openDb } = await import("../lib/sqlite");
+  const itemLog = await import("../lib/itemLog");
+  const m = stubbed();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mi = m as any;
+  const sessionId = "sql-next-turn";
+  mi.sessions.set(sessionId, { sessionId, cwd: "/tmp", loaded: true, running: false, attachedGen: mi.generation, queue: [] });
+  mi.testDurable.set(sessionId, 100);
+  const sent: string[] = [], completions: (() => void)[] = [];
+  mi.bridge.request = (_method: string, params: { prompt: { text: string }[] }) => {
+    sent.push(params.prompt[0].text);
+    return new Promise((resolve) => { completions.push(() => resolve({})); });
+  };
+  const emitted = vi.spyOn(mi, "emit");
+  await m.prompt(sessionId, [{ type: "text", text: "original" }]);
+  await m.prompt(sessionId, [{ type: "text", text: "next" }]);
+  const queuedId = m.queueState(sessionId).queue[0].id;
+  mi.emit(sessionId, "session_update", { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "saved thought" } });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const db = openDb(join(stateDir, "itemlog.db"));
+  try {
+    db.exec(`CREATE TRIGGER reject_queued_turn BEFORE INSERT ON items
+      WHEN NEW.session_id = 'sql-next-turn' AND NEW.done = 1
+      BEGIN SELECT RAISE(ABORT, 'temporary SQLite failure'); END`);
+    mi.testDurable.set(sessionId, 110);
+    completions[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(sent).toEqual(["original"]);
+    expect(m.queueState(sessionId)).toMatchObject({ running: false, queued: 1, queue: [{ id: queuedId, text: "next" }] });
+    expect(m.provisional(sessionId)).toContainEqual(expect.objectContaining({ role: "thought", text: "saved thought" }));
+    db.exec("DROP TRIGGER reject_queued_turn");
+    mi.sessions.get(sessionId).turnRetryAfter = 0;
+    await mi.reattachStale();
+    await mi.reattachStale();
+    expect(sent).toEqual(["original", "next"]);
+    expect(emitted.mock.calls.filter(([, type, data]) => type === "session_update" &&
+      (data as { echoId?: string }).echoId === queuedId)).toHaveLength(1);
+    itemLog.itemLogResetForTests();
+    expect(itemLog.itemLogLoadRetained(sessionId)).toContainEqual(expect.objectContaining({ role: "thought", text: "saved thought", done: true }));
+    completions[1]();
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    db.exec("DROP TRIGGER IF EXISTS reject_queued_turn"); db.close();
+    mi.dbSub?.(); itemLog.itemLogForget(sessionId);
+  }
+});
+
+it("restores and gates an ended SQLite turn when prompt is the first call after restart", async () => {
+  const { openDb } = await import("../lib/sqlite");
+  const itemLog = await import("../lib/itemLog");
+  const sessionId = "sql-prompt-first";
+  itemLog.itemLogSave(sessionId, "old-process-turn", 100, [{
+    id: "old-process-thought", kind: "text", role: "thought", text: "before restart",
+    done: true, seqFrom: 40, seqTo: 41,
+  }], true);
+  itemLog.itemLogResetForTests();
+  const db = openDb(join(stateDir, "itemlog.db"));
+  const m = stubbed();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mi = m as any;
+  mi.sessions.set(sessionId, { sessionId, cwd: "/tmp", loaded: true, running: false, attachedGen: mi.generation, queue: [] });
+  // Set the fixture tip without invoking any region/view read before prompt.
+  mi.testDurable.set(sessionId, 110);
+  const sent: string[] = [];
+  let complete!: () => void;
+  mi.bridge.request = (_method: string, params: { prompt: { text: string }[] }) => {
+    sent.push(params.prompt[0].text);
+    return new Promise((resolve) => { complete = () => resolve({}); });
+  };
+  try {
+    db.exec(`CREATE TRIGGER reject_restart_finalize BEFORE INSERT ON items
+      WHEN NEW.session_id = 'sql-prompt-first' AND NEW.done = 1
+      BEGIN SELECT RAISE(ABORT, 'temporary SQLite failure'); END`);
+    expect(await m.prompt(sessionId, [{ type: "text", text: "after restart" }])).toEqual({ queued: true });
+    expect(sent).toEqual([]);
+    expect(m.queueState(sessionId)).toMatchObject({ running: false, queued: 1 });
+    expect(itemLog.itemLogRestore(sessionId)?.items).toContainEqual(expect.objectContaining({ text: "before restart" }));
+    db.exec("DROP TRIGGER reject_restart_finalize");
+    mi.sessions.get(sessionId).turnRetryAfter = 0;
+    await mi.reattachStale();
+    await mi.reattachStale();
+    expect(sent).toEqual(["after restart"]);
+    itemLog.itemLogResetForTests();
+    expect(itemLog.itemLogLoadRetained(sessionId)).toContainEqual(expect.objectContaining({ text: "before restart", done: true }));
+    complete();
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    db.exec("DROP TRIGGER IF EXISTS reject_restart_finalize"); db.close();
+    mi.dbSub?.(); itemLog.itemLogForget(sessionId);
+  }
 });
