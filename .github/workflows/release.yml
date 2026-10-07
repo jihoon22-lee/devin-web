@@ -96,9 +96,9 @@ jobs:
           jq -e '[.[].check_runs[] | select(.name == "CI Gate")] | length > 0 and all(.[]; .conclusion == "success")' checks.json
           jq -e '[.[].check_runs[] | select(.name | startswith("CodeQL"))] | length > 0 and all(.[]; .conclusion == "success")' checks.json
           # GitHub can mark the upload successful while the analysis record has an error.
-          gh api "repos/$GH_REPO/code-scanning/analyses?ref=refs/heads/main&tool_name=CodeQL&per_page=100" --paginate --slurp > analyses.json
+          gh api "repos/$GH_REPO/code-scanning/analyses?tool_name=CodeQL&per_page=100" --paginate --slurp > analyses.json
           jq -e --arg sha "$CANDIDATE" '
-            [.[][] | select(.category == ".github/workflows/security.yml:codeql")] as $analyses |
+            [.[][] | select(.ref == "refs/heads/main" and .category == ".github/workflows/security.yml:codeql")] as $analyses |
             ($analyses | map(.created_at) | max) as $latest |
             [$analyses[] | select(.created_at == $latest)] |
             length > 0 and all(.[]; (.created_at | type == "string") and
