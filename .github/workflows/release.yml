@@ -98,8 +98,11 @@ jobs:
           # GitHub can mark the upload successful while the analysis record has an error.
           gh api "repos/$GH_REPO/code-scanning/analyses?ref=refs/heads/main&tool_name=CodeQL&per_page=100" --paginate --slurp > analyses.json
           jq -e --arg sha "$CANDIDATE" '
-            [.[][] | select(.category == ".github/workflows/security.yml:codeql")] |
-            max_by(.created_at) | .commit_sha == $sha and .error == "" and (.rules_count | type == "number" and . > 0)
+            [.[][] | select(.category == ".github/workflows/security.yml:codeql")] as $analyses |
+            ($analyses | map(.created_at) | max) as $latest |
+            [$analyses[] | select(.created_at == $latest)] |
+            length > 0 and all(.[]; (.created_at | type == "string") and
+              .commit_sha == $sha and .error == "" and (.rules_count | type == "number" and . > 0))
           ' analyses.json
           # A successful analysis job alone does not mean its findings were reviewed.
           gh api "repos/$GH_REPO/code-scanning/alerts?state=open&ref=refs/heads/main&per_page=100" --paginate --slurp > alerts.json
