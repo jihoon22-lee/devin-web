@@ -8,7 +8,7 @@ Required:
 
 - Node.js **≥24.18.0 and <25**, which supplies the SQLite API used by the app.
 - pnpm **9.15.9**, matching `packageManager` and the committed lockfile.
-- Devin CLI installed through its official distribution and authenticated as the user who runs this service. `devin --version` and `devin auth status` should succeed.
+- Devin CLI installed through its official distribution and authenticated as the user who runs this service. `devin --version` and `devin auth status` should succeed. The initial release was exercised with Devin CLI **3000.11.3**; inspect the health badge for schema compatibility when using another CLI version.
 - Bash, curl, and common Linux tools. Managed operation uses `setsid` (util-linux), `ss` (iproute2), `ps`/`pgrep` (procps), and GNU coreutils/grep.
 - For native `node-pty` compilation: Python 3, make, and a C/C++ compiler. On Debian/Ubuntu these are typically supplied by `python3` and `build-essential`.
 - Git for cloning, `pnpm verify`, worktree creation, and the Changes tab. Installation, build, and ordinary session usage from a source archive do not require Git.
