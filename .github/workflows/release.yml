@@ -35,6 +35,13 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typegen && pnpm verify && pnpm docs:check && pnpm public:check
       - run: node bin/check-audit.mjs && bash bin/scan-secrets.sh
+      # The Azure mirror was observed throttling package downloads on hosted runners.
+      # Keep signed Ubuntu packages and all browser prerequisites, using the primary archive.
+      - name: Select Ubuntu package mirror
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test:e2e && pnpm test:daemon
       - name: Package the verified commit
