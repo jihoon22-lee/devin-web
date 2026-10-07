@@ -234,15 +234,16 @@ describe("public launcher boundaries", () => {
       await ctl(root, ["stop", "--all"], settings);
     }
   }, 20000);
-  it.each(["web", "acpd"])("reaps a %s launch that hangs before publishing its service identity", async (role) => {
-    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: role === "web" ? "0" : "1", DEVIN_WEB_DEVIN_BIN: "/isolated/fake-acp" };
-    const script = role === "web" ? "devin-web.mjs" : "devin-acpd.mjs";
+  it.each(["web", "acpd", "watch"])("reaps a %s launch that hangs before publishing its service identity", async (role) => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: role === "acpd" ? "1" : "0", DEVIN_WEB_DEVIN_BIN: "/isolated/fake-acp" };
+    const script = role === "web" ? "devin-web.mjs" : role === "acpd" ? "devin-acpd.mjs" : "devin-web-watch.mjs";
     writeFileSync(join(root, "bin", script), `
       import { writeFileSync } from "node:fs";
       writeFileSync(process.env.DEVIN_WEB_STATE_DIR + "/stalled-pid", String(process.pid));
       setInterval(() => {}, 1000);
     `);
     const result = await ctl(root, ["start"], settings, 22000);
+    await expect.poll(() => existsSync(join(root, "state/stalled-pid"))).toBe(true);
     const pid = Number(readFileSync(join(root, "state/stalled-pid"), "utf8"));
     ownedProcesses.push(pid);
     expect(result.code).not.toBe(0);
@@ -264,15 +265,34 @@ describe("public launcher boundaries", () => {
     `));
     const web = join(root, "bin/devin-web.mjs");
     writeFileSync(web, 'import { appendFileSync as recordLaunch } from "node:fs";\nrecordLaunch(process.env.DEVIN_WEB_STATE_DIR + "/launch-attempts", String(process.pid) + "\\n");\n' + readFileSync(web, "utf8").replace(/^#!.*\n/, ""));
+    // Hold the watchdog between launch ownership and its ready PID record.
+    // The first ctl must retain its lock until that startup completes.
+    const watch = join(root, "bin/devin-web-watch.mjs");
+    writeFileSync(watch, 'await new Promise(resolve => setTimeout(resolve, 1500));\n' + readFileSync(watch, "utf8").replace(/^#!.*\n/, ""));
     try {
       const results = await Promise.all([ctl(root, ["start"], settings), ctl(root, ["start"], settings)]);
       const launches = readFileSync(join(root, "state/launch-attempts"), "utf8").trim().split("\n").map(Number);
       ownedProcesses.push(...launches);
       expect(results.map(r => r.code), results.map(r => r.stderr).join("\n")).toEqual([0, 0]);
       expect(launches).toHaveLength(1);
+      expect(existsSync(join(root, "state/web-watch.pid.identity.json"))).toBe(true);
       expect((await fetch(`http://127.0.0.1:${settings.PORT}`)).status).toBe(200);
     } finally { await ctl(root, ["stop"], settings); }
   }, 18000);
+  it("reports watchdog startup failure and reaps the services created by that start", async () => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
+    writeFileSync(join(root, "bin/devin-web-watch.mjs"), `
+      import { writeFileSync } from "node:fs";
+      writeFileSync(process.env.DEVIN_WEB_STATE_DIR + "/failed-watch", String(process.pid));
+      throw new Error("fixture watchdog initialization failed");
+    `);
+    const result = await ctl(root, ["start"], settings);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/watch.*failed/i);
+    expect(existsSync(join(root, "state/pid"))).toBe(false);
+    const watcher = Number(readFileSync(join(root, "state/failed-watch"), "utf8"));
+    await expect.poll(() => alive(watcher)).toBe(false);
+  }, 15000);
   it("refuses a second start while a verified launch is still initializing", async () => {
     const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
     mkdirSync(join(root, "state"));

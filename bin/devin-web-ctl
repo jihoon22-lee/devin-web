@@ -123,10 +123,21 @@ watch_start() {
   pid_alive "$WATCH_PIDFILE" && return 0
   ensure_state
   rm -f "$WATCH_PIDFILE"
-  local launch_id
+  local launch_id started_watch
   launch_id="$(new_launch_id)"
   setsid nohup env "DEVIN_WEB_LAUNCH_ID=$launch_id" "DEVIN_WEB_PORT=$PORT" "DEVIN_WEB_STATE_DIR=$STATE" \
     node "$ROOT/bin/process-identity.mjs" launch "$WATCH_PIDFILE" watch >>"$WATCH_LOG" 2>&1 9>&- &
+  started_watch=$!
+  # Keep the lifecycle lock until supervision is ready. Otherwise a waiting
+  # start sees only .launch ownership and mistakes our startup for a conflict.
+  for _ in $(seq 1 40); do
+    if pid_alive "$WATCH_PIDFILE"; then return 0; fi
+    kill -0 "$started_watch" 2>/dev/null || break
+    sleep 0.25
+  done
+  echo "devin-web-watch failed to start — see $WATCH_LOG" >&2
+  cleanup_created "$WATCH_PIDFILE" "$launch_id"
+  return 1
 }
 
 watch_stop() {
@@ -298,7 +309,7 @@ start() {
   preflight || return 1
   if pid_alive "$PIDFILE"; then
     rm -f "$DISABLED"
-    watch_start
+    watch_start || return 1
     echo "already running (pid $(cat "$PIDFILE")) → $URL"
     return 0
   fi
@@ -331,7 +342,11 @@ start() {
     # Only consider readiness after this launch has published its pidfile.
     if [[ -f $PIDFILE && $(cat "$PIDFILE") == "$started_web" ]] && curl -sf -o /dev/null --max-time 1 "$URL/"; then
       rm -f "$DISABLED"
-      watch_start
+      if ! watch_start; then
+        cleanup_created "$PIDFILE" "$web_launch_id"
+        cleanup_created "$ACPD_PIDFILE" "$started_acpd"
+        return 1
+      fi
       echo "devin-web up (pid $(cat "$PIDFILE")) → $URL"
       return 0
     fi
