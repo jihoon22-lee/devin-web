@@ -127,8 +127,16 @@ test("web restart preserves daemon, agent, PTY, permission and exactly-once queu
     // Completed request IDs are expired; stale tabs cannot answer them again.
     expect((await request.post(`/api/sessions/${SID}/respond`, { headers, data: answeredBody })).status()).toBe(404);
     await page.reload();
-    await expect(page.locator("main")).toContainText("queued-drained-once");
-    expect((await page.locator("main").innerText()).split("queued-drained-once")).toHaveLength(2);
+    // A one-shot main.innerText can omit every content-visibility:auto row
+    // during the first layout after reload, even when textContent and the
+    // durable snapshot already contain them. Wait for the actual reply row,
+    // checking both global cardinality and its canonical durable identity.
+    const queuedReplies = page.locator('main [id^="msg-"]').filter({ hasText: "queued-drained-once" });
+    await expect(queuedReplies).toHaveCount(1);
+    // Two seed rows, then user/assistant pairs for the active and queued turns.
+    await expect(queuedReplies).toHaveAttribute("id", "msg-bf-6");
+    await expect(queuedReplies).toBeInViewport();
+    await expect(queuedReplies).toHaveText("queued-drained-once", { useInnerText: true });
 
     // JSON-RPC permits recycling a completed wire ID. An old tab's answer
     // must not accidentally approve a later request that happens to reuse it.
