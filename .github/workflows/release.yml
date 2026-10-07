@@ -91,9 +91,9 @@ jobs:
           test "$(jq -r .version release/manifest.json)" = "$VERSION"
           test "$(jq -r .source release/manifest.json)" = "devin-web-$VERSION.tar.gz"
           (cd release && sha256sum --check SHA256SUMS)
-          gh api "repos/$GH_REPO/commits/$CANDIDATE/check-runs" --paginate --jq '.check_runs[] | [.name,.conclusion] | @tsv' > checks.tsv
-          grep -Fx $'CI Gate\tsuccess' checks.tsv
-          grep -E '^CodeQL.*\ssuccess$' checks.tsv
+          gh api "repos/$GH_REPO/commits/$CANDIDATE/check-runs?filter=latest&per_page=100" --paginate --slurp > checks.json
+          jq -e '[.[].check_runs[] | select(.name == "CI Gate")] | length > 0 and all(.[]; .conclusion == "success")' checks.json
+          jq -e '[.[].check_runs[] | select(.name | startswith("CodeQL"))] | length > 0 and all(.[]; .conclusion == "success")' checks.json
           # A matching pre-existing tag or release is a hard failure.
           if gh api "repos/$GH_REPO/git/ref/tags/v$VERSION" >/dev/null 2>&1; then exit 1; fi
           if gh release view "v$VERSION" >/dev/null 2>&1; then exit 1; fi
