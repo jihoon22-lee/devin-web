@@ -40,10 +40,15 @@ export function fixtureEnvironment(fixture, inherited = process.env) {
     DEVIN_WEB_PORT: fixture.daemon ? "3201" : "3200",
     DEVIN_WEB_HOST: "127.0.0.1",
     DEVIN_WEB_ACPD: fixture.daemon ? "1" : "0",
-    ...(fixture.daemon ? {
-      DEVIN_WEB_ACP_SOCK: join(fixture.state, "acp.sock"),
-      DEVIN_WEB_HOST_SOCK: join(fixture.state, "host.sock"),
-    } : {}),
+    // Missing keys can be populated by Next's repository .env files. Empty
+    // strings explicitly disable standalone sockets/debug/host additions.
+    DEVIN_WEB_ACP_SOCK: fixture.daemon ? join(fixture.state, "acp.sock") : "",
+    DEVIN_WEB_HOST_SOCK: fixture.daemon ? join(fixture.state, "host.sock") : "",
+    DEVIN_WEB_DEBUG: "",
+    DEVIN_WEB_TAILNET: "",
+    DEVIN_WEB_ALLOWED_HOSTS: "",
+    DEVIN_WEB_PUSH_SUBJECT: "mailto:e2e@example.invalid",
+    DEVIN_WEB_ACP_FALLBACK: "0",
     FAKE_ACP_SESSIONS_FILE: join(fixture.root, "sessions.json"),
     FAKE_ACP_SCRIPT: join(fixture.root, "turn-script.json"),
     FAKE_ACP_DB: join(fixture.cli, "sessions.db"),

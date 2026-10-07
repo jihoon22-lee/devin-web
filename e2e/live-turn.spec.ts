@@ -4,8 +4,8 @@ import { join } from "node:path";
 
 /** Live-turn flows against the fake agent's scripted turns (FAKE_ACP_SCRIPT —
  *  see test/fixtures/fake-acp.mjs). Each spec writes the script fresh and keys
- *  its turn by a `match` substring in the prompt text, so tests don't share
- *  agent state. */
+ *  its turn by a `match` substring in the prompt text. Tests share the spec's
+ *  session, so completed turns explicitly commit their durable rows. */
 
 const FIX = join(process.cwd(), ".e2e-fixture");
 const SCRIPT = join(FIX, "turn-script.json");
@@ -39,6 +39,10 @@ async function send(page: Page, text: string) {
   await page.getByRole("button", { name: /^(Send|Queue message)$/ }).click();
 }
 
+async function expectDurable(page: Page, text: string) {
+  await expect(page.locator("main [id^='msg-bf-']", { hasText: text })).toHaveCount(1, { timeout: 20_000 });
+}
+
 test.beforeEach(() => rmSync(SCRIPT, { force: true }));
 test.afterEach(() => rmSync(SCRIPT, { force: true }));
 
@@ -55,6 +59,8 @@ test("prompt renders ONE user bubble even when the agent relays the same user_me
         // same text as the server's synthetic echo, different seq
         { delayMs: 80, emit: { sessionUpdate: "user_message", content: [{ type: "text", text: "$PROMPT" }] } },
         { delayMs: 80, emit: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "e2e-dedup reply" } } },
+        { commit: { role: "user", text: "$PROMPT" } },
+        { commit: { role: "assistant", text: "e2e-dedup reply" } },
       ],
     },
   ]);
@@ -65,6 +71,8 @@ test("prompt renders ONE user bubble even when the agent relays the same user_me
   await expect(page.locator("main")).toContainText("e2e-dedup reply", { timeout: 20_000 });
   await expect(page.locator("role=status")).toHaveCount(0, { timeout: 20_000 }); // turn ended
   await expect(bubbles).toHaveCount(1);
+  await expectDurable(page, "echo-dedup-probe: one bubble only");
+  await expectDurable(page, "e2e-dedup reply");
 });
 
 test("streamed chunks render once and the status bar clears at turn end", async ({
@@ -80,6 +88,8 @@ test("streamed chunks render once and the status bar clears at turn end", async 
         { delayMs: 120, emit: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "e2e-stream alpha " } } },
         { delayMs: 120, emit: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "beta " } } },
         { delayMs: 300, emit: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "omega-tail" } } },
+        { commit: { role: "user", text: "$PROMPT" } },
+        { commit: { role: "assistant", text: "e2e-stream alpha beta omega-tail" } },
       ],
     },
   ]);
@@ -96,6 +106,7 @@ test("streamed chunks render once and the status bar clears at turn end", async 
   // one message item, not one per chunk — .dw-virt wraps each ChatItem
   await expect(page.locator("main .dw-virt", { hasText: "e2e-stream" })).toHaveCount(1);
   await expect(status).toHaveCount(0, { timeout: 20_000 });
+  await expectDurable(page, "e2e-stream alpha beta omega-tail");
 });
 
 test("permission card approves the agent request and the turn continues", async ({
@@ -127,6 +138,9 @@ test("permission card approves the agent request and the turn continues", async 
           },
         },
         { delayMs: 60, emit: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "e2e-after-permission outcome=$RESP" } } },
+        { commit: { role: "user", text: "$PROMPT" } },
+        { commit: { role: "assistant", text: "I need to run something." } },
+        { commit: { role: "assistant", text: "e2e-after-permission outcome=$RESP" } },
       ],
     },
   ]);
@@ -145,6 +159,7 @@ test("permission card approves the agent request and the turn continues", async 
     timeout: 20_000,
   });
   await expect(page.locator("role=status")).toHaveCount(0, { timeout: 20_000 });
+  await expectDurable(page, "e2e-after-permission outcome=allow");
 });
 
 test("a prompt sent mid-turn queues, then runs after turn_end", async ({ page, request }) => {
@@ -155,12 +170,16 @@ test("a prompt sent mid-turn queues, then runs after turn_end", async ({ page, r
       steps: [
         { delayMs: 60, emit: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "e2e-queue first reply" } } },
         { delayMs: 1200 }, // stay busy long enough to park the next prompt
+        { commit: { role: "user", text: "$PROMPT" } },
+        { commit: { role: "assistant", text: "e2e-queue first reply" } },
       ],
     },
     {
       match: "queue-second",
       steps: [
         { delayMs: 60, emit: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "e2e-queue second reply" } } },
+        { commit: { role: "user", text: "$PROMPT" } },
+        { commit: { role: "assistant", text: "e2e-queue second reply" } },
       ],
     },
   ]);
@@ -179,6 +198,8 @@ test("a prompt sent mid-turn queues, then runs after turn_end", async ({ page, r
   });
   await expect(page.locator("main")).toContainText("e2e-queue second reply", { timeout: 20_000 });
   await expect(status).toHaveCount(0, { timeout: 20_000 });
+  await expectDurable(page, "e2e-queue first reply");
+  await expectDurable(page, "e2e-queue second reply");
 });
 
 test("Stop cancels the in-flight turn and clears the status bar", async ({ page, request }) => {
@@ -187,6 +208,10 @@ test("Stop cancels the in-flight turn and clears the status bar", async ({ page,
     {
       match: "cancel-probe",
       steps: [
+        // Persist the partial turn before exposing the Stop assertion. The
+        // running watermark still withholds these rows until cancellation.
+        { commit: { role: "user", text: "$PROMPT" } },
+        { commit: { role: "assistant", text: "e2e-cancel partial" } },
         { delayMs: 60, emit: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "e2e-cancel partial" } } },
         { delayMs: 30_000 }, // hung turn — only session/cancel ends it
       ],
@@ -203,6 +228,7 @@ test("Stop cancels the in-flight turn and clears the status bar", async ({ page,
   await expect(status).toHaveCount(0, { timeout: 15_000 });
   // the partial reply stays — cancel freezes the transcript, it doesn't erase
   await expect(page.locator("main")).toContainText("e2e-cancel partial");
+  await expectDurable(page, "e2e-cancel partial");
 });
 
 test("user_message_chunk halves matching the echo render as one bubble", async ({
@@ -217,6 +243,8 @@ test("user_message_chunk halves matching the echo render as one bubble", async (
         { delayMs: 60, emit: { sessionUpdate: "user_message_chunk", content: { type: "text", text: "chunk-echo" } } },
         { delayMs: 60, emit: { sessionUpdate: "user_message_chunk", content: { type: "text", text: " probe halves" } } },
         { delayMs: 60, emit: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "e2e-chunk reply" } } },
+        { commit: { role: "user", text: "$PROMPT" } },
+        { commit: { role: "assistant", text: "e2e-chunk reply" } },
       ],
     },
   ]);
@@ -227,4 +255,6 @@ test("user_message_chunk halves matching the echo render as one bubble", async (
   await expect(
     page.locator("main div.self-end", { hasText: "chunk-echo probe halves" }),
   ).toHaveCount(1);
+  await expect(page.locator("role=status")).toHaveCount(0, { timeout: 20_000 });
+  await expectDurable(page, "e2e-chunk reply");
 });
