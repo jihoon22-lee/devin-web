@@ -28,7 +28,7 @@ pnpm build
 
 `verify` typechecks the TypeScript app and JavaScript daemon layers, runs Vitest, and lints. It does not rebuild a live `.next`. `build` does overwrite the default build directory; follow [operations](docs/operations.md) when working in an installed checkout. `pnpm check` combines verification and build.
 
-`pnpm install` installs a local pre-push hook when Git metadata is present, preserves a differing existing hook, and skips source archives. The hook runs `pnpm verify`; if you bypass it or already use another hook, run verification explicitly for the exact change being pushed. CI is an additional check, not a substitute for the requested local evidence.
+`pnpm install` installs a local pre-push hook when Git metadata is present, preserves a differing existing hook, skips with a notice when core.hooksPath resolves outside this repo, and skips source archives. The hook runs `pnpm verify`; if you bypass it or already use another hook, run verification explicitly for the exact change being pushed. CI is an additional check, not a substitute for the requested local evidence.
 
 For user-flow, reconnect, and responsive changes, run the isolated browser suite:
 

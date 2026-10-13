@@ -274,12 +274,25 @@ acpd_restart_when_idle() {
   rm -f "$ACPD_IDLE_PIDFILE"
   # detached — the asking session's own turn may be the busy one; when the
   # restart lands that turn dies, and so would an inline waiter
-  local launch_id
+  local launch_id started_idle
   launch_id="$(new_launch_id)"
   setsid nohup env "DEVIN_WEB_LAUNCH_ID=$launch_id" "DEVIN_WEB_PORT=$PORT" "DEVIN_WEB_STATE_DIR=$STATE" \
     "DEVIN_WEB_ACP_SOCK=$ACPD_SOCK" \
     node "$ROOT/bin/process-identity.mjs" launch "$ACPD_IDLE_PIDFILE" idle >>"$ACPD_WATCH_LOG" 2>&1 9>&- &
-  echo "idle-restart watcher armed — 'acpd restart' fires once all sessions are idle (log: $ACPD_WATCH_LOG)"
+  started_idle=$!
+  # The watcher exits right away when acpd isn't an owned process — don't
+  # claim armed until its identity proves it stayed up (same as watch_start).
+  for _ in $(seq 1 20); do
+    if pid_alive "$ACPD_IDLE_PIDFILE"; then
+      echo "idle-restart watcher armed — 'acpd restart' fires once all sessions are idle (log: $ACPD_WATCH_LOG)"
+      return 0
+    fi
+    kill -0 "$started_idle" 2>/dev/null || break
+    sleep 0.25
+  done
+  echo "idle-restart watcher did not stay armed — see $ACPD_WATCH_LOG" >&2
+  cleanup_created "$ACPD_IDLE_PIDFILE" "$launch_id"
+  return 1
 }
 
 acpd_restart() {

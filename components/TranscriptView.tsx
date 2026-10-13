@@ -53,6 +53,10 @@ function SessionTranscriptView({ session, jump, onRetry, onTakeover, onOpenSideb
   const [jumpError, setJumpError] = useState<{ target: JumpTarget; message: string } | null>(null);
   const lifetime = useRef<AbortController | null>(null);
   const pendingLoad = useRef<AbortSignal | null>(null);
+  // a load() arriving while one is in flight is dropped for ordering — record
+  // it so the in-flight load's finally re-runs instead of losing e.g. the
+  // reconnect-triggered recovery until the next 8s poll
+  const reloadRequested = useRef(false);
   const windowVersion = useRef(0);
   const olderRequest = useRef<{ controller: AbortController; target?: JumpTarget } | null>(null);
   useLayoutEffect(() => {
@@ -107,7 +111,11 @@ function SessionTranscriptView({ session, jump, onRetry, onTakeover, onOpenSideb
   // of order and regress either the displayed window or its REST cursor.
   const load = useCallback(async () => {
     const signal = lifetime.current?.signal;
-    if (!signal || signal.aborted || pendingLoad.current === signal) return;
+    if (!signal || signal.aborted) return;
+    if (pendingLoad.current === signal) {
+      reloadRequested.current = true;
+      return;
+    }
     pendingLoad.current = signal;
     const after = lastId.current;
     try {
@@ -137,6 +145,9 @@ function SessionTranscriptView({ session, jump, onRetry, onTakeover, onOpenSideb
       if (!signal.aborted) setErr((e as Error).message);
     } finally {
       if (pendingLoad.current === signal) pendingLoad.current = null;
+      const retry = reloadRequested.current;
+      reloadRequested.current = false;
+      if (retry && !signal.aborted) void load();
     }
   }, [session.sessionId, merge, markActivity]);
 

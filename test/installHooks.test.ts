@@ -72,7 +72,7 @@ describe("install-hooks", () => {
     expect(existsSync(hook(root))).toBe(true);
     expect(existsSync(hook(foreign))).toBe(false);
   });
-  it.each(["global", "environment"])("preserves intentional %s core.hooksPath configuration", (kind) => {
+  it.each(["global", "environment"])("refuses to install into a %s-scoped core.hooksPath", (kind) => {
     const root = repo(); const dir = join(mk(), "hooks");
     if (kind === "global") {
       const config = join(mk(), "gitconfig");
@@ -83,8 +83,25 @@ describe("install-hooks", () => {
       vi.stubEnv("GIT_CONFIG_KEY_0", "core.hooksPath");
       vi.stubEnv("GIT_CONFIG_VALUE_0", dir);
     }
+    const msgs: string[] = [];
+    installHooks({ root, log: (m: unknown) => msgs.push(String(m)) });
+    // the hook lives in a dir shared by every repo — writing it would run
+    // `pnpm verify` on pushes of unrelated projects
+    expect(existsSync(join(dir, "pre-push"))).toBe(false);
+    expect(existsSync(hook(root))).toBe(false);
+    expect(msgs.join(" ")).toContain("outside this repository");
+  });
+  it("a local core.hooksPath wins over a global one — installs in the local dir", () => {
+    const root = repo();
+    const globalDir = join(mk(), "global-hooks");
+    const config = join(mk(), "gitconfig");
+    writeFileSync(config, `[core]\n  hooksPath = ${globalDir}\n`);
+    vi.stubEnv("GIT_CONFIG_GLOBAL", config);
+    const localDir = join(mk(), "local-hooks");
+    git(root, "config", "core.hooksPath", localDir);
     installHooks({ root, log: silent });
-    expect(readFileSync(join(dir, "pre-push"), "utf8")).toContain("exec pnpm verify");
+    expect(readFileSync(join(localDir, "pre-push"), "utf8")).toContain("exec pnpm verify");
+    expect(existsSync(join(globalDir, "pre-push"))).toBe(false);
     expect(existsSync(hook(root))).toBe(false);
   });
   it("linked worktree installs in Git's common hooks directory", () => {

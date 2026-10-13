@@ -134,7 +134,7 @@ function shimBusy() {
 async function tick() {
   const now = currentAcpdIdentity();
   if (startIdentity.status !== "owned" || now.status !== "owned" || JSON.stringify(now.record) !== JSON.stringify(startIdentity.record)) {
-    log(`acpd pid changed ${startPid} → ${now} — restarted by someone else; done`);
+    log(`acpd pid changed ${startPid} → ${now.record?.pid ?? now.status} — restarted by someone else; done`);
     return cleanup(0);
   }
   if (Date.now() > deadline) {
@@ -170,6 +170,9 @@ async function tick() {
 
 function main() {
   identity = writeProcessIdentity(MY_PIDFILE, "idle");
+  // Default signal termination never runs 'exit' hooks — route through
+  // cleanup so the pidfile and launch record are removed on stop.
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => cleanup(0));
   log(`watching for an idle gap to restart acpd (was pid ${startPid ?? "?"})`);
   tick();
 }
