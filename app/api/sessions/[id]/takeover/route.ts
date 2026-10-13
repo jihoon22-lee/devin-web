@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { manager } from "@/lib/state";
+import { existingSessionCwdError } from "@/lib/sessionCwd";
 import { lockOwner, killLockOwner, removeLock } from "@/lib/locks";
 
 export const dynamic = "force-dynamic";
@@ -16,6 +17,10 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     const { id } = await ctx.params;
     const { cwd } = (await req.json()) as { cwd?: string };
     if (!cwd) return NextResponse.json({ error: "cwd required" }, { status: 400 });
+    const denied = await existingSessionCwdError(cwd, async () =>
+      manager().getSession(id)?.cwd ??
+      (await manager().listSessions()).find((s) => s.sessionId === id)?.cwd);
+    if (denied) return NextResponse.json({ error: denied }, { status: 403 });
     const m = manager();
 
     try {

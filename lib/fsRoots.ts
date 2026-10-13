@@ -33,6 +33,14 @@ export function configuredRoots(): readonly string[] {
   return roots;
 }
 
+/** Gate for a caller-supplied session cwd: a session's cwd later widens
+ *  browser fs access (sessionRoots) and the agent fs gate, so while
+ *  DEVIN_WEB_FS_ROOTS is configured it must lie inside it. Returns the 403
+ *  message, or null when allowed. */
+export function cwdRootsError(dir: string): string | null {
+  return roots.length > 0 && !pathInRoots(dir, roots) ? `cwd outside DEVIN_WEB_FS_ROOTS: ${dir}` : null;
+}
+
 export { pathInRoots };
 
 /** Session working directories are always browsable — a session's own
