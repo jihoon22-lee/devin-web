@@ -275,6 +275,8 @@ export class SessionManager {
   private dbSub: (() => void) | null = null;
   /** test seam — pretend the durable db advanced to a node_id */
   private testDurable = new Map<string, number>();
+  /** test seam — durable spine rows the fake db holds (sessions.db is empty in tests) */
+  private testSpine = new Map<string, DurableSpineRow[]>();
 
   /** Memoized per sessions.db commit. `durableThrough` sits on request and
    *  push paths (every transcript delta, every provisional flush, the /items
@@ -314,8 +316,9 @@ export class SessionManager {
 
   /** test-only: pretend the durable db advanced, then run the drop check the
    *  real sessions.db watcher would trigger. Production never calls this. */
-  __testDurableThrough(sessionId: string, n: number) {
+  __testDurableThrough(sessionId: string, n: number, spine: DurableSpineRow[] = []) {
     this.testDurable.set(sessionId, n);
+    if (spine.length) this.testSpine.set(sessionId, [...(this.testSpine.get(sessionId) ?? []), ...spine]);
     this.regions.onDurableChange();
   }
 
@@ -332,6 +335,8 @@ export class SessionManager {
     after: number,
     through: number,
   ): DurableSpineRow[] {
+    const fake = this.testSpine.get(sessionId);
+    if (fake) return fake.filter((r) => r.nodeId > after && r.nodeId <= through);
     try {
       const db = openSessionsDb();
       try {
@@ -1026,7 +1031,10 @@ export class SessionManager {
         s.turnRetryStartedAt ??= Date.now();
         s.turnRetryDelay = Math.min((s.turnRetryDelay ?? 500) * 2, 30_000);
         s.turnRetryAfter = Date.now() + s.turnRetryDelay;
-        if (firstFailure) this.emit(s.sessionId, "notice", { text: startError
+        // a bounded wait for the previous answer's durable row is routine —
+        // only real storage/start problems deserve the notice
+        const quiet = !startError && this.regions.awaitingCommit(s.sessionId);
+        if (firstFailure && !quiet) this.emit(s.sessionId, "notice", { text: startError
           ? `Could not start the turn: ${startError}. Your prompt is kept in the queue; retrying automatically.`
           : "The previous transcript is not ready. Your prompt is kept in the queue; retrying automatically." });
         if (!s.turnRetryWarned && Date.now() - s.turnRetryStartedAt >= 30_000) {

@@ -1,9 +1,15 @@
 /** Running-turn regions and retained ephemera. External DB, persistence and
  *  event publication are injected; this class owns only region lifecycle. */
 import { ItemAssembler, type AssembleEvent, type AssembledItem } from "./itemAssembler";
-import { computeAnchors, type DurableSpineRow } from "./alignSpine";
+import { computeAnchors, isSpine, type DurableSpineRow } from "./alignSpine";
 import { capRetainedTurns } from "./retained";
 import { noteIntegrityBeacon } from "../integrityBeacon";
+
+/** An ended turn whose last agent/tool item has no durable twin yet waits
+ *  this long for the CLI's commit (it does not acknowledge the ACP prompt
+ *  response) before finalizing without it. Bounded: a structural mismatch
+ *  (e.g. the CLI merging two messages) must never park the queue forever. */
+export const FINALIZE_GRACE_MS = 5_000;
 
 export interface TurnRegionStorage {
   restore(sessionId: string): { turnId: string; startNode: number; ended: boolean; items: AssembledItem[] } | null;
@@ -54,8 +60,10 @@ export class TurnRegions {
   // assembled server-side; durable rows must never advance into it ----
   private prov = new Map<
     string,
-    { asm: ItemAssembler; turnId: string; turnStartNode: number; ended: boolean }
+    { asm: ItemAssembler; turnId: string; turnStartNode: number; ended: boolean; endedAt?: number }
   >();
+  /** one pending grace re-check per session (see FINALIZE_GRACE_MS) */
+  private graceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private turnSeq = 0;
   private failedFinalizations = new Map<string, string>();
   /** sessions whose provisional region changed since the last flush */
@@ -70,6 +78,11 @@ export class TurnRegions {
   turnOpen(sessionId: string): boolean {
     const ps = this.prov.get(sessionId);
     return !!ps && !ps.ended;
+  }
+
+  /** An ended turn is waiting (bounded) for its final durable row. */
+  awaitingCommit(sessionId: string): boolean {
+    return this.graceTimers.has(sessionId);
   }
 
   /** sessions whose session/load is in flight — the agent replays the whole
@@ -140,7 +153,7 @@ export class TurnRegions {
    *  the provisional region for a later retry. */
   private finalizeTurn(
     sid: string,
-    ps: { asm: ItemAssembler; turnId: string; turnStartNode: number },
+    ps: { asm: ItemAssembler; turnId: string; turnStartNode: number; endedAt?: number },
   ) {
     let alignment: ReturnType<typeof computeAnchors>;
     try {
@@ -157,6 +170,22 @@ export class TurnRegions {
       // A restart can then retry without discarding the last unflushed text.
       this.deps.storage.save(sid, ps.turnId, ps.turnStartNode, ps.asm.list(), true);
       return false;
+    }
+    // Mid-turn commits already satisfy maxNode > turnStartNode; the answer
+    // that ends the turn may still be in flight. User echoes are exempt —
+    // user-echo-only endings may retire without a commit.
+    const lastSpine = ps.asm.list()
+      .filter((i) => isSpine(i) && !(i.kind === "text" && i.role === "user"))
+      .at(-1);
+    if (lastSpine && !alignment.aligned.has(lastSpine.id)) {
+      // restored regions carry no endedAt: the web was down, the wait is over
+      const waited = Date.now() - (ps.endedAt ?? 0);
+      if (waited < FINALIZE_GRACE_MS) {
+        this.armGrace(sid, FINALIZE_GRACE_MS - waited);
+        return false;
+      }
+      noteIntegrityBeacon("server:finalizeUnaligned");
+      console.error(`[integrity] ${sid} finalizeUnaligned ${lastSpine.id}`);
     }
     try {
       const { anchors, violations } = alignment;
@@ -195,6 +224,16 @@ export class TurnRegions {
     }
   }
 
+  private armGrace(sid: string, ms: number) {
+    if (this.graceTimers.has(sid)) return;
+    const timer = setTimeout(() => {
+      this.graceTimers.delete(sid);
+      this.onDurableChange();
+    }, Math.max(1, ms));
+    timer.unref?.();
+    this.graceTimers.set(sid, timer);
+  }
+
   /** sessions.db committed: an ended turn whose start is now covered by
    *  durable rows is dropped wholesale — the durable region replaces it.
    *  Counterpart-less items survive as anchored retained items. */
@@ -205,6 +244,9 @@ export class TurnRegions {
       if (!ps.ended) continue;
       if (this.deps.maxNode(sid) > ps.turnStartNode) {
         if (!this.finalizeTurn(sid, ps)) continue;
+        const grace = this.graceTimers.get(sid);
+        if (grace) clearTimeout(grace);
+        this.graceTimers.delete(sid);
         this.prov.delete(sid);
         dropped = true;
         const regions = {
@@ -341,6 +383,7 @@ export class TurnRegions {
     ) {
       ps.asm.closeAll();
       ps.ended = true;
+      ps.endedAt = Date.now();
       // a turn that assembled nothing can never be covered — release the
       // watermark freeze at once instead of pinning durable forever
       if (!ps.asm.list().length) {
@@ -362,6 +405,7 @@ export class TurnRegions {
       if (running === false && !ps.ended) {
         ps.asm.closeAll();
         ps.ended = true;
+        ps.endedAt = Date.now();
         this.onDurableChange(); // durable commits may have pre-landed
         this.scheduleProvFlush(sid);
       }
@@ -405,6 +449,9 @@ export class TurnRegions {
 
   /** Session deletion also cancels its pending flush and restart state. */
   forget(sessionId: string): void {
+    const grace = this.graceTimers.get(sessionId);
+    if (grace) clearTimeout(grace);
+    this.graceTimers.delete(sessionId);
     this.failedFinalizations.delete(sessionId);
     this.deps.invalidateDurable(sessionId);
     this.prov.delete(sessionId);
