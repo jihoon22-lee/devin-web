@@ -72,6 +72,7 @@ function db(): SqlDb | null {
       cache = d;
     } catch {
       broken = true;
+      console.error("[diag] itemlog.db unavailable — provisional turns are retained in memory only");
       return null;
     }
   }
@@ -193,7 +194,10 @@ export function itemLogSave(
 /** Turn ended AND durable covers it — convert the region to retained items.
  *  `keep` maps the counterpart-less item ids (thoughts, plans) to the durable
  *  node_id they render after; every other item of the turn is deleted (its
- *  durable twin now renders it). Best-effort like every write here. */
+ *  durable twin now renders it). Returns false only when a write to an open
+ *  log failed (the caller retains the region and retries); true when the
+ *  finalize persisted OR the log is unavailable — a rebuildable log that
+ *  cannot open has nothing to preserve, and must never wedge a turn. */
 export function itemLogFinalize(
   sessionId: string,
   turnId: string,
@@ -201,7 +205,7 @@ export function itemLogFinalize(
   latest?: { startNode: number; items: AssembledItem[] },
 ): boolean {
   const d = db();
-  if (!d) return false;
+  if (!d) return true;
   try {
     d.exec("BEGIN");
     try {

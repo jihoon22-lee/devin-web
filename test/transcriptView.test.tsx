@@ -149,3 +149,16 @@ it.each(["empty", "error"])("stops search paging after an %s page instead of rep
   expect(api.mock.calls.filter(([p]) => p.includes("?before=")).length).toBe(1);
   expect(screen.queryByText(/Search result not found/)).not.toBeNull();
 });
+
+it("re-runs a load that arrived while another was in flight", async () => {
+  vi.useFakeTimers();
+  const first = deferred<unknown>();
+  api.mockImplementationOnce(() => first.promise)
+    .mockResolvedValue({ items: [], truncated: false });
+  render(<TranscriptView session={{ sessionId: "s", cwd: "/tmp" }} onRetry={() => {}} />);
+  await act(async () => {}); // initial load is in flight on `first`
+  await act(async () => { await vi.advanceTimersByTimeAsync(8000); }); // poll drops onto pendingLoad
+  expect(api.mock.calls).toHaveLength(1);
+  await act(async () => { first.resolve({ items: [], truncated: false }); });
+  expect(api.mock.calls).toHaveLength(2); // the dropped poll re-ran immediately
+});

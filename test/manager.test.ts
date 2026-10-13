@@ -1612,6 +1612,33 @@ describe("adopted concurrent prompt completion", () => {
     await new Promise((r) => setImmediate(r));
     expect(m.getSession("unknown")?.running).toBe(true);
   });
+
+  it("emits the deferred turn_end payload (usage) when the adopted turn finishes", async () => {
+    const m = stubbed(), mi = m as any;
+    const sessionId = "deferred-usage";
+    let busy = true;
+    vi.spyOn(m.bridge, "socketMode", "get").mockReturnValue(true);
+    vi.spyOn(m.bridge, "daemonState").mockImplementation(async () => ({ gen: 1,
+      sessions: [{ sessionId, cwd: "/tmp", loadResult: {}, busy }] }));
+    const usage = { inputTokens: 7, outputTokens: 3 };
+    mi.bridge.request = (method: string) => method === METHODS.sessionPrompt
+      ? Promise.resolve({ stopReason: "end_turn", usage })
+      : Promise.resolve({});
+    mi.sessions.set(sessionId, { sessionId, cwd: "/tmp", loaded: true, running: false, attachedGen: mi.generation, queue: [] });
+    const emitted = vi.spyOn(mi, "emit");
+    await m.prompt(sessionId, [{ type: "text", text: "hi" }] as never);
+    await new Promise((r) => setImmediate(r));
+    // the daemon is still busy past the prompt response — the turn_end is
+    // held, not emitted as an empty payload
+    expect(m.getSession(sessionId)?.running).toBe(true);
+    expect(emitted.mock.calls.filter(([, type]) => type === "turn_end")).toHaveLength(0);
+    busy = false;
+    mi.onNotification("_devin-web/turn_end", { sessionId, remainingPrompts: 0 });
+    await new Promise((r) => setImmediate(r));
+    const ends = emitted.mock.calls.filter(([, type]) => type === "turn_end");
+    expect(ends.at(-1)?.[2]).toEqual({ stopReason: "end_turn", usage });
+    expect(m.getSession(sessionId)?.running).toBe(false);
+  });
   /* eslint-enable @typescript-eslint/no-explicit-any */
 });
 

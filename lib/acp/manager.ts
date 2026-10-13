@@ -82,6 +82,10 @@ interface ActiveSession {
    *  signal is real (a turn did end) but can't clear running yet; the steer's
    *  settle consumes it to decide whether anything may still be live */
   steerSawTurnEnd?: boolean;
+  /** turn_end data held while the session stays running past its prompt
+   *  response (daemon still busy or a steer in flight) — emitted when the
+   *  adopted turn finishes so the response's usage isn't dropped */
+  deferredTurnEnd?: unknown;
   /** auto-reattach is suppressed until this time after a failed attempt */
   reattachAfter?: number;
   /** last reattach error — surfaced via listSessions as attachFailed */
@@ -659,7 +663,8 @@ export class SessionManager {
   private finishIdleAdoptedTurn(s: ActiveSession) {
     if (!s.running || s.ownsTurn || s.steerInFlight || s.deleted) return;
     s.running = false;
-    this.emit(s.sessionId, "turn_end", {});
+    this.emit(s.sessionId, "turn_end", s.deferredTurnEnd ?? {});
+    s.deferredTurnEnd = undefined;
     this.afterTurn(s);
   }
 
@@ -1088,6 +1093,7 @@ export class SessionManager {
     const generation = this.generation;
     const owner = Symbol("prompt");
     s.ownedRun = owner;
+    s.deferredTurnEnd = undefined;
     const owns = () => this.generation === generation && this.sessions.get(s.sessionId) === s &&
       s.ownedRun === owner && !s.deleted;
     try {
@@ -1123,6 +1129,9 @@ export class SessionManager {
       const daemonBusy = this.bridge.socketMode ? await this.daemonStillBusy(s) : false;
       if (!owns()) return;
       s.running = s.attachedGen === this.generation && (daemonBusy || (s.steerInFlight ?? 0) > 0);
+      // the turn isn't over per the daemon (or a steer is still out) — keep
+      // the response's turn_end payload so the real finish can emit it
+      if (s.running && completion?.type === "turn_end") s.deferredTurnEnd = completion.data;
       if (!s.running && !s.deleted && completion) this.emit(s.sessionId, completion.type, completion.data);
       s.ownsTurn = false;
       s.ownedRun = undefined;

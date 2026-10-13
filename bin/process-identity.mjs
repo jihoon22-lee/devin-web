@@ -93,15 +93,37 @@ export function adoptProcessIdentity(file, role) {
 
 export function processOwnership(file, role) {
   let pid;
-  try { pid = pidFromFile(file); } catch (error) { return { status: error.code === "ENOENT" ? "absent" : "unverified" }; }
+  try { pid = pidFromFile(file); } catch (error) {
+    return error.code === "ENOENT" ? { status: "absent" } : { status: "unverified", reason: "invalid pid file" };
+  }
   let current;
-  try { current = identity(pid); } catch (error) { return { status: ["ENOENT", "ESRCH"].includes(error.code) ? "dead" : "unverified" }; }
-  try {
-    const record = JSON.parse(readFileSync(sidecar(file), "utf8"));
-    const { config, ...saved } = record;
-    if (!same(saved, current) || !same(config, configuration(role))) return { status: "unverified" };
-    return { status: "owned", record };
-  } catch { return { status: "unverified" }; }
+  try { current = identity(pid); } catch (error) {
+    return ["ENOENT", "ESRCH"].includes(error.code)
+      ? { status: "dead" }
+      : { status: "unverified", reason: "live process identity unreadable" };
+  }
+  let record;
+  try { record = JSON.parse(readFileSync(sidecar(file), "utf8")); }
+  catch { return { status: "unverified", reason: "missing/unreadable identity record" }; }
+  const { config, ...saved } = record;
+  // A different boot, or a different startTime on the same boot, means the
+  // recorded process is provably gone and the pid was reused — the record is
+  // stale state to clean, not ambiguous ownership. `stale` deliberately has
+  // no `record` key so readers of `.record?.pid` never see a dead pid as live.
+  if (saved.pid === pid && (saved.bootId !== current.bootId || saved.startTime !== current.startTime)) {
+    return { status: "stale", stale: record };
+  }
+  const reasons = [];
+  const diff = [...new Set([...Object.keys(saved), ...Object.keys(current)])].filter((k) => !same(saved[k], current[k]));
+  if (diff.length) reasons.push(`identity differs: ${diff.join(", ")}`);
+  const expected = configuration(role);
+  if (!same(config, expected)) {
+    for (const k of new Set([...Object.keys(config ?? {}), ...Object.keys(expected)])) {
+      if (!same(config?.[k], expected[k])) reasons.push(`config.${k}: recorded ${JSON.stringify(config?.[k])} vs current ${JSON.stringify(expected[k])}`);
+    }
+  }
+  if (reasons.length) return { status: "unverified", reason: reasons.join("; ") };
+  return { status: "owned", record };
 }
 
 export function removeProcessIdentity(file, record) {
@@ -154,7 +176,9 @@ function shutdownTargets(record) {
 async function stopOwned(file, role) {
   const first = processOwnership(file, role);
   if (first.status === "absent" || first.status === "dead") return;
-  if (first.status !== "owned") throw new Error("unverified process ownership; refusing signal");
+  // The recorded owner is provably dead — remove the stale pair, signal nothing.
+  if (first.status === "stale") { removeProcessIdentity(file, first.stale); return; }
+  if (first.status !== "owned") throw new Error(`unverified process ownership; refusing signal (${first.reason ?? "unknown"})`);
   const record = first.record;
   const targets = shutdownTargets(record);
   const checkOwnership = async () => {
@@ -163,11 +187,12 @@ async function stopOwned(file, role) {
       // Linux may clear argv/environ while an exiting process is briefly
       // still visible as running. Do not signal through an uncertain read;
       // let that transition settle, then require verified ownership or death.
-      if (fresh.status === "unverified" && attempt < 2) {
+      const uncertain = fresh.status === "unverified" || fresh.status === "stale";
+      if (uncertain && attempt < 2) {
         await new Promise(r => setTimeout(r, 10));
         continue;
       }
-      if (fresh.status === "unverified" || (fresh.status === "owned" && !same(fresh.record, record))) throw new Error("process identity changed during shutdown; refusing escalation");
+      if (uncertain || (fresh.status === "owned" && !same(fresh.record, record))) throw new Error("process identity changed during shutdown; refusing escalation");
       return;
     }
   };
@@ -179,7 +204,7 @@ async function stopOwned(file, role) {
     try { process.kill(target.pid, sig); } catch (error) { if (error.code !== "ESRCH") throw error; }
   };
   for (const target of targets) await signal(target, "SIGTERM");
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 50; i++) {
     await checkOwnership();
     if (!targets.some(matchesProcess)) break;
     await new Promise(r => setTimeout(r, 100));
@@ -187,6 +212,14 @@ async function stopOwned(file, role) {
   await checkOwnership();
   for (const target of targets) await signal(target, "SIGKILL");
   removeProcessIdentity(file, record);
+  // The `.launch` pair belongs to the same dead process — drop it too so a
+  // later pid reuse can't leave a stale launch record wedging `guard`.
+  if (!file.endsWith(".launch")) {
+    try {
+      const launched = JSON.parse(readFileSync(sidecar(`${file}.launch`), "utf8"));
+      if (launched.pid === record.pid) removeProcessIdentity(`${file}.launch`, launched);
+    } catch { /* no usable launch record */ }
+  }
 }
 
 // Publish launch ownership BEFORE any application imports or initialization.
@@ -226,11 +259,18 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     else if (command === "adopt") adoptProcessIdentity(file, role);
     else if (command === "stop") await stopOwned(file, role);
     else {
-      const result = processOwnership(file, role);
+      let result = processOwnership(file, role);
       if (command === "alive") process.exitCode = result.status === "owned" ? 0 : 1;
       else if (command === "guard") {
-        const pending = processOwnership(`${file}.launch`, role);
-        if (result.status === "unverified" || pending.status === "unverified") throw new Error(`unverified process ownership at ${file}; inspect and explicitly adopt a legitimate legacy process with process-identity.mjs adopt (port/config must match)`);
+        let pending = processOwnership(`${file}.launch`, role);
+        // A stale record describes a provably-dead process — clean it and
+        // treat the file as absent rather than wedging lifecycle operations.
+        if (result.status === "stale") { removeProcessIdentity(file, result.stale); result = { status: "absent" }; }
+        if (pending.status === "stale") { removeProcessIdentity(`${file}.launch`, pending.stale); pending = { status: "absent" }; }
+        if (result.status === "unverified" || pending.status === "unverified") {
+          const bad = result.status === "unverified" ? result : pending;
+          throw new Error(`unverified process ownership at ${file} (${bad.reason ?? "unknown"}); inspect and explicitly adopt a legitimate legacy process with process-identity.mjs adopt (port/config must match)`);
+        }
         if (pending.status === "owned" && result.status !== "owned") throw new Error(`process initializing at ${file}; launch already in progress`);
         if (pending.status === "owned" && result.status === "owned" && (pending.record.pid !== result.record.pid || pending.record.launchId !== result.record.launchId)) throw new Error(`conflicting process ownership at ${file}`);
       } else throw new Error("unknown process identity command");

@@ -6,6 +6,8 @@
 //   - hook missing → write it (0755)
 //   - hook identical → just ensure the exec bit
 //   - hook exists with DIFFERENT content → keep it, warn — never clobber
+//   - core.hooksPath scoped outside this repo → skip with a notice (a shared
+//     hooks dir would run `pnpm verify` for every repo)
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { gitEnvironment } from "../lib/gitEnv.mjs";
 import { execFileSync } from "node:child_process";
@@ -18,6 +20,21 @@ const HOOK_BODY = `#!/bin/sh
 exec pnpm verify
 `;
 
+// Scope of the winning core.hooksPath value: the last `config --get-all`
+// line's first token. null = unset (exit 1/empty); "unknown" = the query
+// itself failed — fail closed rather than write into an untracked scope.
+function hooksPathScope(root) {
+  let out;
+  try {
+    out = execFileSync("git", ["-C", root, "config", "--show-scope", "--get-all", "core.hooksPath"], { encoding: "utf8", env: gitEnvironment(), stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    return e && typeof e === "object" && e.status === 1 ? null : "unknown";
+  }
+  const lines = out.trim().split("\n").filter(Boolean);
+  if (!lines.length) return null;
+  return lines.at(-1).split(/\s+/, 1)[0];
+}
+
 export function installHooks({ root = ROOT, log = console.log } = {}) {
   // Ask Git: linked worktrees share the common hooks directory, and
   // core.hooksPath (including inherited configuration) overrides it.
@@ -26,6 +43,17 @@ export function installHooks({ root = ROOT, log = console.log } = {}) {
   try {
     dst = resolve(root, execFileSync("git", ["-C", root, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"], { encoding: "utf8", env: gitEnvironment(), stdio: ["ignore", "pipe", "pipe"] }).trim());
   } catch { return 0; } // Git-free archives/installations remain supported.
+  // A hooksPath set outside this repo (global/system/command scope) would
+  // drop our `pnpm verify` hook into a directory shared by EVERY repo —
+  // install nowhere instead. Only repo-local intent (local/worktree scope)
+  // or no override at all is honored.
+  const scope = hooksPathScope(root);
+  if (scope !== null && scope !== "local" && scope !== "worktree") {
+    log(scope === "unknown"
+      ? "install-hooks: core.hooksPath scope could not be determined — pre-push hook not installed; run `pnpm verify` before pushing"
+      : `install-hooks: core.hooksPath is configured outside this repository (${scope} scope) — pre-push hook not installed; run \`pnpm verify\` before pushing`);
+    return 0;
+  }
   const hooksDir = dirname(dst);
   try {
     if (existsSync(dst)) {

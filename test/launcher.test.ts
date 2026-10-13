@@ -1,11 +1,14 @@
 import { execFile, spawn } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { launchOptions, validateNode } from "../bin/runtime.mjs";
+import { processOwnership } from "../bin/process-identity.mjs";
 
 const exec = promisify(execFile);
 const roots: string[] = [];
@@ -351,7 +354,7 @@ describe("public launcher boundaries", () => {
     expect(alive(child.pid!)).toBe(true);
     expect(existsSync(join(root, "state/pid.identity.json"))).toBe(true);
   });
-  it.each(["startTime", "pgid", "config"])("ctl refuses changed %s ownership without signalling its service", async (field) => {
+  it.each(["pgid", "config"])("ctl refuses changed %s ownership without signalling its service", async (field) => {
     const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
     expect((await ctl(root, ["start"], settings)).code).toBe(0);
     const path = join(root, "state/pid.identity.json");
@@ -366,6 +369,134 @@ describe("public launcher boundaries", () => {
       expect((await fetch(`http://127.0.0.1:${settings.PORT}`)).status).toBe(200);
     } finally { writeFileSync(path, original); await ctl(root, ["stop"], settings); }
   }, 15000);
+  it("ctl stop clears a stale startTime record without signalling the live service", async () => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
+    expect((await ctl(root, ["start"], settings)).code).toBe(0);
+    const path = join(root, "state/pid.identity.json");
+    const original = readFileSync(path, "utf8"); const record = JSON.parse(original);
+    record.startTime = "wrong";
+    writeFileSync(path, JSON.stringify(record));
+    const pid = Number(readFileSync(join(root, "state/pid"), "utf8"));
+    try {
+      await ctl(root, ["stop"], settings);
+      // The stale record is provably-dead state: it is cleaned, but the live
+      // service ctl can no longer claim ownership of is never signalled.
+      expect(alive(pid)).toBe(true);
+      expect((await fetch(`http://127.0.0.1:${settings.PORT}`)).status).toBe(200);
+      expect(existsSync(join(root, "state/pid"))).toBe(false);
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      writeFileSync(join(root, "state/pid"), String(pid));
+      writeFileSync(path, original);
+      await ctl(root, ["stop"], settings);
+      try { process.kill(-pid, "SIGKILL"); } catch {}
+      await expect.poll(() => alive(pid), { timeout: 2000 }).toBe(false);
+    }
+  }, 15000);
+  it.each([
+    ["bootId", { bootId: "00000000-0000-0000-0000-000000000000" }],
+    ["startTime", { startTime: "1" }],
+  ])("guard/stop clear a provably-stale record (%s) without touching the reused PID", async (_label, mutation) => {
+    const root = serviceFixture(); mkdirSync(join(root, "state"));
+    const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
+    const file = join(root, "state/web-watch.pid");
+    const helper = join(root, "bin/process-identity.mjs");
+    // A real writeProcessIdentity produces the record shape; pid + one
+    // identity field are then rewritten to simulate a foreign process reusing
+    // the recorded pid (same pid, provably different process).
+    await exec(process.execPath, ["-e",
+      `import(${JSON.stringify(pathToFileURL(helper).href)}).then(m=>m.writeProcessIdentity(${JSON.stringify(file)},"watch"))`],
+      { env: env(root, settings) });
+    const record = JSON.parse(readFileSync(`${file}.identity.json`, "utf8"));
+    const sleeper = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" });
+    ownedProcesses.push(sleeper.pid!); sleeper.unref();
+    await once(sleeper, "spawn");
+    Object.assign(record, mutation, { pid: sleeper.pid });
+    const place = () => {
+      writeFileSync(`${file}.identity.json`, JSON.stringify(record));
+      writeFileSync(file, String(sleeper.pid));
+    };
+    const run = (cmd: string) => exec(process.execPath, [helper, cmd, file, "watch"], { env: env(root, settings) })
+      .then((r) => ({ ...r, code: 0 }), (e) => e as { stdout: string; stderr: string; code: number });
+
+    place();
+    const stopped = await run("stop");
+    expect(stopped.code, stopped.stderr).toBe(0);
+    expect(alive(sleeper.pid!)).toBe(true);
+    expect(existsSync(file)).toBe(false);
+    expect(existsSync(`${file}.identity.json`)).toBe(false);
+
+    place();
+    const guarded = await run("guard");
+    expect(guarded.code, guarded.stderr).toBe(0);
+    expect(existsSync(file)).toBe(false);
+    expect(existsSync(`${file}.identity.json`)).toBe(false);
+
+    place();
+    const aliveResult = await run("alive");
+    expect(aliveResult.code).toBe(1); // stale is never "owned"
+    expect(existsSync(file)).toBe(true); // alive is read-only — no cleanup
+    expect(alive(sleeper.pid!)).toBe(true);
+  }, 15000);
+  it("ctl stop leaves no web-watch.pid* files; a reused launch pid stays startable", async () => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
+    try {
+      expect((await ctl(root, ["start"], settings)).code).toBe(0);
+      const launchFile = join(root, "state/web-watch.pid.launch");
+      await expect.poll(() => existsSync(`${launchFile}.identity.json`)).toBe(true);
+      const savedSidecar = readFileSync(`${launchFile}.identity.json`, "utf8");
+      expect((await ctl(root, ["stop"], settings)).code).toBe(0);
+      expect(readdirSync(join(root, "state")).filter((f) => f.startsWith("web-watch.pid"))).toEqual([]);
+      // Regression: an older/crashed stop may leave the launch pair behind
+      // and the recorded pid can be reused by a foreign process — the stale
+      // record (same pid, dead watch's startTime) must be cleaned, not refused.
+      const sleeper = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" });
+      ownedProcesses.push(sleeper.pid!); sleeper.unref();
+      await once(sleeper, "spawn");
+      const record = JSON.parse(savedSidecar);
+      record.pid = sleeper.pid;
+      writeFileSync(`${launchFile}.identity.json`, JSON.stringify(record));
+      writeFileSync(launchFile, String(sleeper.pid));
+      const restarted = await ctl(root, ["start"], settings);
+      expect(restarted.code, restarted.stderr).toBe(0);
+    } finally { await ctl(root, ["stop"], settings); }
+  }, 30000);
+  it("processOwnership reports stale without a record field for a reused pid", async () => {
+    const file = join(process.env.DEVIN_WEB_STATE_DIR!, `zz-stale-${process.pid}.pid`);
+    const sleeper = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" });
+    ownedProcesses.push(sleeper.pid!); sleeper.unref();
+    await once(sleeper, "spawn");
+    writeFileSync(file, String(sleeper.pid));
+    writeFileSync(`${file}.identity.json`, JSON.stringify({
+      pid: sleeper.pid, bootId: "00000000-0000-0000-0000-000000000000", startTime: "1", config: {},
+    }));
+    const result = processOwnership(file, "watch");
+    expect(result.status).toBe("stale");
+    expect(result).not.toHaveProperty("record");
+    expect(result).toHaveProperty("stale");
+  });
+  it("processOwnership explains an unverified record by differing field", async () => {
+    const file = join(process.env.DEVIN_WEB_STATE_DIR!, `zz-reason-${process.pid}.pid`);
+    const helper = join(process.cwd(), "bin/process-identity.mjs");
+    // The live child writes its own real record, so exactly one mutated field
+    // differs — the reason must name that field, not a generic mismatch.
+    const child = spawn(process.execPath, ["-e",
+      `import(${JSON.stringify(pathToFileURL(helper).href)}).then(m=>m.writeProcessIdentity(${JSON.stringify(file)},"watch")); setInterval(()=>{},1000)`],
+      { detached: true, stdio: "ignore", env: { ...process.env } });
+    ownedProcesses.push(child.pid!); child.unref();
+    await once(child, "spawn");
+    await expect.poll(() => existsSync(`${file}.identity.json`)).toBe(true);
+    const record = JSON.parse(readFileSync(`${file}.identity.json`, "utf8"));
+    expect(processOwnership(file, "watch").status).toBe("owned");
+    writeFileSync(`${file}.identity.json`, JSON.stringify({ ...record, pgid: -1 }));
+    const pgidResult = processOwnership(file, "watch");
+    expect(pgidResult.status).toBe("unverified");
+    expect(pgidResult.reason).toContain("pgid");
+    writeFileSync(`${file}.identity.json`, JSON.stringify({ ...record, config: { ...record.config, port: "1" } }));
+    const portResult = processOwnership(file, "watch");
+    expect(portResult.status).toBe("unverified");
+    expect(portResult.reason).toContain("config.port");
+  });
   it.each(["managed", "legacy"])("explicit adoption verifies a %s service and rejects a foreign PID", async (mode) => {
     const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
     if (mode === "managed") expect((await ctl(root, ["start"], settings)).code).toBe(0);
@@ -435,6 +566,17 @@ describe("public launcher boundaries", () => {
       expect(JSON.parse(readFileSync(join(root, "state/child-env.json"), "utf8")).DEVIN_WEB_ACP_FALLBACK).toBe("0");
     } finally { await ctl(root, ["stop", "--all"], settings); }
   }, 30000);
+  it("ctl acpd restart --when-idle reports a watcher that exits instead of staying armed", async () => {
+    const root = serviceFixture(); const settings = { PORT: await freePort(), DEVIN_WEB_ACPD: "0" };
+    // fixture() does not copy it — the real watcher is needed so it exits on
+    // its own when no owned acpd exists.
+    copyFileSync(join(process.cwd(), "bin/devin-web-idle-restart.mjs"), join(root, "bin/devin-web-idle-restart.mjs"));
+    const result = await ctl(root, ["acpd", "restart", "--when-idle"], settings, 20000);
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("did not stay armed");
+    expect(existsSync(join(root, "state/acpd-idle-restart.pid"))).toBe(false);
+    expect(existsSync(join(root, "state/acpd-idle-restart.pid.launch"))).toBe(false);
+  }, 25000);
   it("ctl restart rejects missing build without deleting disabled or pid markers", async () => {
     const root = fixture(false); mkdirSync(join(root, "state"));
     writeFileSync(join(root, "state/pid"), "2147483647"); writeFileSync(join(root, "state/web.disabled"), "keep");

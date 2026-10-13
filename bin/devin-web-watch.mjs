@@ -132,6 +132,9 @@ const IS_MAIN =
 if (IS_MAIN) {
   const identity = writeProcessIdentity(PIDFILE, "watch");
   process.on("exit", () => removeProcessIdentity(PIDFILE, identity));
+  // Default signal termination never runs 'exit' hooks — convert to
+  // process.exit so the pidfile AND the launch record clean up on stop.
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => process.exit(0));
   log(`watching ${HEALTH} — ctl start after ${FAILS_NEEDED} consecutive failures`);
   // keep the interval REF'd — it IS this process's reason to stay alive
   setInterval(() => void tick().catch((e) => log(`tick error: ${e.message}`)), INTERVAL_MS);
