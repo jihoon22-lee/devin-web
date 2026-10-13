@@ -1,6 +1,6 @@
 import { writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import { readTextFile } from "./fsRead.mjs";
+import { resolveAgentPath } from "./fsGate.mjs";
 import { LineDecoder, encodeMessage } from "./ndjson";
 import { defaultConnector, type AcpConnector, type AcpTransport } from "./transport";
 import type {
@@ -15,7 +15,7 @@ import type {
 } from "./types";
 import { METHODS } from "./types";
 import { terminalPool } from "./terminal";
-import { fsPathAllowed, pathInRoots } from "../fsRoots";
+import { configuredRoots } from "../fsRoots";
 
 type Pending = {
   resolve: (v: unknown) => void;
@@ -354,19 +354,14 @@ export class AcpBridge {
     switch (method) {
       case METHODS.fsRead: {
         const r = p as unknown as ReadTextFileRequest;
-        const base = this.handlers.sessionCwd?.(r.sessionId) ?? process.cwd();
-        const path = resolve(base, r.path);
-        if (!fsPathAllowed(path) && !pathInRoots(path, [base]))
-          throw new Error(`path outside DEVIN_WEB_FS_ROOTS: ${r.path}`);
+        // same rule as the daemon's detached path (lib/acp/fsGate.mjs)
+        const path = resolveAgentPath(r.path, this.handlers.sessionCwd?.(r.sessionId), configuredRoots());
         return { content: await readTextFile(path, r.line, r.limit) };
       }
       case METHODS.fsWrite: {
         const r = p as unknown as WriteTextFileRequest;
-        const wbase = this.handlers.sessionCwd?.(r.sessionId) ?? process.cwd();
-        const wpath = resolve(wbase, r.path);
-        if (!fsPathAllowed(wpath) && !pathInRoots(wpath, [wbase]))
-          throw new Error(`path outside DEVIN_WEB_FS_ROOTS: ${r.path}`);
-        await writeFile(wpath, r.content, "utf8");
+        const path = resolveAgentPath(r.path, this.handlers.sessionCwd?.(r.sessionId), configuredRoots());
+        await writeFile(path, r.content, "utf8");
         return {};
       }
       case METHODS.terminalCreate: {

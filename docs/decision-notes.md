@@ -52,7 +52,7 @@ Capability names and ACP method names differ: advertise `cognition.ai/revert`, c
 
 ## Test environment and fs roots
 
-Tests clear inherited daemon sockets and point state/CLI paths at per-file temporary fixtures. React `act` requires the development environment used by the test command. Empty configured root lists mean unrestricted, but an empty list of implicit session roots must never widen an explicitly configured gate.
+Tests clear inherited daemon sockets and point state/CLI paths at per-file temporary fixtures. React `act` requires the development environment used by the test command. Empty configured root lists mean unrestricted, but an empty list of implicit session roots must never widen an explicitly configured gate. Agent file requests use one rule in the web and the daemon — configured roots plus the requesting session's own working directory — and never resolve a relative path against the serving process's directory.
 
 ## Daemon wire and ownership
 

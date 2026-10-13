@@ -60,6 +60,9 @@ interface ActiveSession {
   /** taken over mid-turn from the daemon — no session/load replay will ever
    *  arrive, so resyncing clients are seeded from the durable transcript */
   adopted?: boolean;
+  /** adopted from the daemon without a recorded cwd — `cwd` is only the
+   *  web's default; agent fs must not resolve relative paths against it */
+  cwdUnknown?: boolean;
   /** a runPrompt in THIS process owns the current turn. The daemon appends a
    *  synthesized turn_end to every prompt response (same tick) — while this is
    *  set that notification is ignored so the queue shifts exactly once (in
@@ -374,7 +377,10 @@ export class SessionManager {
       // not this process's cwd — the web server runs from the devin-web repo,
       // so resolving there lands another project's artifacts in this tree
       // (the b9-*.png pollution).
-      sessionCwd: (sid) => this.sessions.get(sid)?.cwd,
+      sessionCwd: (sid) => {
+        const s = this.sessions.get(sid);
+        return s && !s.cwdUnknown ? s.cwd : undefined;
+      },
       onExit: (code, signal) => {
         this.broadcastGlobal({ type: "agent_exit", data: { code, signal } });
         this.generation++;
@@ -447,6 +453,7 @@ export class SessionManager {
       this.sessions.set(d.sessionId, {
         sessionId: d.sessionId,
         cwd: d.cwd ?? this.defaultCwd,
+        cwdUnknown: d.cwd == null,
         running: true,
         loaded: true,
         attachedGen: this.generation,

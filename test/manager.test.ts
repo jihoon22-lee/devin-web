@@ -1830,6 +1830,20 @@ it("holds a queued prompt quietly while the previous answer's durable row lags",
   emitted.mockRestore();
 });
 
+it("an adopted session without a daemon-recorded cwd exposes no fs base to the bridge", async () => {
+  const m = stubbed();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mi = m as any;
+  mi.bridge.proc = { pid: -1 }; // daemon socket mode
+  mi.bridge.request = async (method: string) =>
+    method === "_devin-web/shim_state"
+      ? { gen: 1, sessions: [{ sessionId: "nocwd", cwd: null, loadResult: null, busy: true }] }
+      : {};
+  await mi.reattachStale();
+  expect(m.getSession("nocwd")?.adopted).toBe(true);
+  expect(mi.bridge.handlers.sessionCwd("nocwd")).toBeUndefined();
+});
+
 it("restores and gates an ended SQLite turn when prompt is the first call after restart", async () => {
   const { openDb } = await import("../lib/sqlite");
   const itemLog = await import("../lib/itemLog");

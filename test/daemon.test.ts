@@ -761,6 +761,15 @@ async function sessionThenDetach(sockPath: string, cwd: string) {
     expect(denied.res.error?.message).toContain("DEVIN_WEB_FS_ROOTS");
   });
 
+  it("L3: a detached relative fs write for an unknown session is refused, not written to the daemon cwd", async () => {
+    const { sockPath } = await startDaemon();
+    await sessionThenDetach(sockPath, await mkdtemp(join(tmpdir(), "acpd-sess-")));
+    const w = await agentFsWhileDetached(sockPath, { id: 84, method: "fs/write_text_file", params: { sessionId: "s-unknown", path: "b9.png", content: "x" } });
+    expect(w.res.error?.message).toContain("relative path without a known session cwd");
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(join(process.cwd(), "b9.png"))).toBe(false);
+  });
+
   it("forwards the agent's fs request to a READY web client unchanged (R12 C3)", async () => {
     const { sockPath } = await startDaemon();
     const c = rpcClient(sockPath);
