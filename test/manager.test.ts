@@ -566,6 +566,28 @@ describe("cancel / exit pending-request cleanup (2-5, 2-6)", () => {
     emitted.mockRestore();
   });
 
+  it("sendQueuedNow failing because the agent restarted warns the prompt may have arrived", async () => {
+    const m = stubbed();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mi = m as any;
+    const emitted = vi.spyOn(mi, "emit");
+    mi.bridge.request = (method: string) => {
+      if (method !== METHODS.sessionPrompt) return Promise.resolve({});
+      mi.generation++; // onExit bumps the generation before the request rejects
+      return Promise.reject(new Error("devin acp exited"));
+    };
+    const s = { sessionId: "s23", cwd: "/tmp/x", running: true, loaded: true, attachedGen: mi.generation, queue: [
+      { id: "q-c", blocks: [{ type: "text", text: "steer" }] },
+    ] as { id: string; blocks: unknown[] }[] };
+    mi.sessions.set("s23", s);
+    expect(m.sendQueuedNow("s23", "q-c")).toEqual({ sent: true });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(s.queue.map((q) => q.id)).toEqual(["q-c"]);
+    const notice = emitted.mock.calls.find(([, type]) => type === "notice");
+    expect((notice?.[2] as { text: string }).text).toMatch(/may already have been received/);
+    emitted.mockRestore();
+  });
+
   it("sendQueuedNow on an idle session just drains the entry", async () => {
     const m = stubbed();
     const prompts: string[] = [];

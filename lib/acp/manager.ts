@@ -1254,8 +1254,13 @@ export class SessionManager {
               queued: s.queue.length,
               queue: queueView(s),
             });
+            // an agent exit rejects in-flight requests even when the agent had
+            // already accepted the steer — say so instead of "never reached"
+            const restarted = generation !== this.generation;
             this.emit(sessionId, "notice", {
-              text: "Send-now failed — the prompt was returned to the queue",
+              text: restarted
+                ? "The agent restarted during send-now — the prompt was returned to the queue but may already have been received; check the conversation before it runs again"
+                : "Send-now failed — the prompt was returned to the queue",
             });
           }
         })

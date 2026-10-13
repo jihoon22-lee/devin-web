@@ -16,6 +16,7 @@ import type {
 import { METHODS } from "./types";
 import { terminalPool } from "./terminal";
 import { configuredRoots } from "../fsRoots";
+import packageJson from "../../package.json";
 
 type Pending = {
   resolve: (v: unknown) => void;
@@ -197,7 +198,7 @@ export class AcpBridge {
         // declare the flag; the echo lives in agentCapabilities._meta
         _meta: { "cognition.ai/revert": true },
       },
-      clientInfo: { name: "devin-web", version: "0.1.0" },
+      clientInfo: { name: "devin-web", version: packageJson.version },
     }, { timeoutMs: this.initTimeoutMs }).catch((e) => {
       // init failed while the child may still be alive — kill it now so it
       // can't outlive the next start(), and detach its listeners so a later

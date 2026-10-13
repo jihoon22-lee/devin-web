@@ -288,3 +288,34 @@ describe("AcpBridge agent fs gate (L3/L4)", () => {
     }
   });
 });
+
+describe("AcpBridge initialize clientInfo (I1)", () => {
+  it("advertises the package.json version", async () => {
+    const { PassThrough } = await import("node:stream");
+    const { EventEmitter } = await import("node:events");
+    const { readFileSync } = await import("node:fs");
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const proc = Object.assign(new EventEmitter(), {
+      pid: 4242, exitCode: null, stdin, stdout, stderr: null,
+      kill() {}, removeAllListeners() { return this; },
+    });
+    let clientInfo: unknown;
+    stdin.on("data", (d) => {
+      for (const line of String(d).split("\n").filter(Boolean)) {
+        const msg = JSON.parse(line);
+        if (msg.method === "initialize") {
+          clientInfo = msg.params.clientInfo;
+          stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } }) + "\n");
+        }
+      }
+    });
+    const b = new AcpBridge(
+      { onSessionUpdate() {}, onNotification() {}, onClientRequest() {}, onExit() {} },
+      [], "unused", 1000, async () => proc as never,
+    );
+    await b.ensure();
+    expect(clientInfo).toEqual({ name: "devin-web", version: pkg.version });
+  });
+});
