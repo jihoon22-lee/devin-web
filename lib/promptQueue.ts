@@ -13,6 +13,29 @@ import type { ContentBlock } from "./acp/types";
 const file = () => join(stateDir(), "prompt-queue.json");
 const blobsDir = () => join(stateDir(), "queue-blobs");
 
+const CORRUPT_PREFIX = "prompt-queue.json.corrupt-";
+
+/** A queue file that no longer parses is user data, not garbage: set it
+ *  aside for manual recovery instead of letting the next write replace it. */
+function quarantine(reason: string) {
+  const aside = join(stateDir(), `${CORRUPT_PREFIX}${Date.now()}`);
+  try {
+    renameSync(file(), aside);
+    console.error(`[promptQueue] unreadable prompt-queue.json (${reason}) moved to ${aside}; queued attachments are kept until it is resolved`);
+  } catch (err) {
+    console.error(`[promptQueue] unreadable prompt-queue.json (${reason}) could not be set aside: ${(err as Error).message}`);
+  }
+}
+
+/** While a set-aside file exists its blobs may still be needed. */
+function quarantinePending(): boolean {
+  try {
+    return readdirSync(stateDir()).some((n) => n.startsWith(CORRUPT_PREFIX));
+  } catch {
+    return false;
+  }
+}
+
 /** Base64 chars above which an image/audio payload is stored out-of-line.
  *  The JSON file is rewritten on EVERY queue mutation — with inline data a
  *  single parked max-size prompt stalls the event loop ~200ms per change
@@ -93,10 +116,24 @@ function load(): Record<string, QueuedPrompt[]> {
     /* absent */
   }
   if (cache && mtime === cacheMtime) return cache;
+  let text: string | null = null;
   try {
-    const raw: unknown = JSON.parse(readFileSync(file(), "utf8"));
-    const out: Record<string, QueuedPrompt[]> = {};
-    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    text = readFileSync(file(), "utf8");
+  } catch {
+    text = null; // absent — an empty queue, nothing to preserve
+  }
+  const out: Record<string, QueuedPrompt[]> = {};
+  if (text !== null) {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch (err) {
+      raw = undefined;
+      quarantine((err as Error).message);
+    }
+    if (raw !== undefined && (!raw || typeof raw !== "object" || Array.isArray(raw))) {
+      quarantine("top level is not an object");
+    } else if (raw !== undefined) {
       for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
         if (!Array.isArray(v)) continue;
         const q = v.filter(
@@ -113,11 +150,13 @@ function load(): Record<string, QueuedPrompt[]> {
         if (hydrated.length) out[k] = hydrated;
       }
     }
-    cache = out;
-  } catch {
-    cache = {};
   }
-  cacheMtime = mtime;
+  cache = out;
+  try {
+    cacheMtime = statSync(file()).mtimeMs;
+  } catch {
+    cacheMtime = -1; // absent or just set aside
+  }
   return cache;
 }
 
@@ -138,13 +177,16 @@ function save(map: Record<string, QueuedPrompt[]>) {
   const tmp = `${file()}.tmp-${process.pid}`;
   writeFileSync(tmp, JSON.stringify(ser) + "\n", { mode: 0o600 });
   renameSync(tmp, file());
-  // sweep blobs no session's queue references anymore — covers entry
-  // removal, session deletion and crash leftovers
-  try {
-    for (const n of readdirSync(blobsDir()))
-      if (!referenced.has(n)) unlinkSync(join(blobsDir(), n));
-  } catch {
-    /* dir absent or a busy file — the next save sweeps */
+  // a set-aside corrupt queue may still reference blobs — keep them all
+  if (!quarantinePending()) {
+    // sweep blobs no session's queue references anymore — covers entry
+    // removal, session deletion and crash leftovers
+    try {
+      for (const n of readdirSync(blobsDir()))
+        if (!referenced.has(n)) unlinkSync(join(blobsDir(), n));
+    } catch {
+      /* dir absent or a busy file — the next save sweeps */
+    }
   }
   cache = map;
   try {

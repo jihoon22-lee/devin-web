@@ -100,6 +100,8 @@ The CLI owns `$DEVIN_CLI_DIR/sessions.db`, its sidecars, and session artifacts. 
 | `search.db`, `treecache.db` | Rebuildable search/tree caches, still containing private source data |
 | Logs, sockets, pidfiles, status and disable markers | Runtime operations; do not restore stale sockets or pidfiles as live state |
 
+If `prompt-queue.json` stops parsing, the web moves it to `prompt-queue.json.corrupt-<ms>` and keeps every file in `queue-blobs/` until no such file remains; recover the entries you need, then delete the set-aside file.
+
 Also preserve project repositories and their linked worktree metadata, and any CLI configuration you need to recover. Worktrees are tied to their source Git repositories; copying only the worktree directory is not a portable repository backup.
 
 For SQLite files that are being written, use SQLite's online backup API or a storage snapshot coordinated across the database and its WAL sidecars. Copying only a live `.db` file can lose committed WAL data. A complete cross-file backup is easiest during a planned **idle** maintenance window: wait for every turn and queued prompt to finish, close valuable shells, stop writers, back up CLI and web state plus project files, then restart with the same configuration. Do not stop active turns just to take a backup. A live backup may be per-file consistent without representing one application-wide point in time.
