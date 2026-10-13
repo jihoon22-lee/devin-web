@@ -607,6 +607,27 @@ describe("N2: prompt error responses also clear busy", () => {
     expect(st.result.sessions.find((s: any) => s.sessionId === "s-fake-1").busy).toBe(false);
     c.close();
   });
+
+  it("a bare {id} prompt ack (no result, no error) also releases busy, like the bridge", async () => {
+    const { sockPath } = await startDaemon();
+    const c = rpcClient(sockPath);
+    c.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    await c.waitFor((l) => l.includes('"id":1'));
+    c.send({ jsonrpc: "2.0", id: 2, method: "session/new", params: {} });
+    await c.waitFor((l) => l.includes('"id":2'));
+    c.send({ jsonrpc: "2.0", id: 3, method: "session/prompt", params: { sessionId: "s-fake-1", _defer: true, prompt: [] } });
+    await new Promise((r) => setTimeout(r, 80));
+    // bridge.ts treats this as a response (test/bridge.test.ts "a bare {id} ack");
+    // the daemon must agree or busy never clears and --when-idle never fires
+    c.send({ jsonrpc: "2.0", method: "TEST_EMIT", params: { line: JSON.stringify({ jsonrpc: "2.0", id: 3 }) } });
+    const te = JSON.parse(await c.waitFor((l) => l.includes("_devin-web/turn_end")));
+    expect(te.params).toMatchObject({ sessionId: "s-fake-1", remainingPrompts: 0 });
+    c.send({ jsonrpc: "2.0", id: 4, method: "_devin-web/shim_state", params: {} });
+    const st = JSON.parse(await c.waitFor((l) => l.includes('"id":4')));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(st.result.sessions.find((s: any) => s.sessionId === "s-fake-1").busy).toBe(false);
+    c.close();
+  });
 });
 
 describe("forked session tracking", () => {
