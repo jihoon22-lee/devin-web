@@ -3,7 +3,7 @@ import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { openDb } from "../lib/sqlite";
 import * as itemLog from "../lib/itemLog";
-import { FINALIZE_GRACE_MS, TurnRegions, type TurnRegionDeps } from "../lib/acp/turnRegions";
+import { FINALIZE_GRACE_MS, TURN_STALL_ALERT_MS, TurnRegions, type TurnRegionDeps } from "../lib/acp/turnRegions";
 import type { AssembledItem } from "../lib/acp/itemAssembler";
 import type { DurableSpineRow } from "../lib/acp/alignSpine";
 import { integrityCount } from "../lib/integrityBeacon";
@@ -380,5 +380,93 @@ describe("M1: final agent row lagging the prompt response", () => {
     h.feed("turn_end", {});
     expect(h.r.awaitingCommit("s")).toBe(false);
     expect(h.r.provisional("s")).toEqual([]);
+  });
+});
+
+describe("stalled ended turn (no durable row)", () => {
+  it("alarms once after TURN_STALL_ALERT_MS while the turn stays withheld", () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const before = integrityCount().total;
+      const h = laggingTurn();
+      h.play();
+      h.feed("turn_end", {}); // tip stays at turnStartNode: no row ever lands
+      vi.advanceTimersByTime(TURN_STALL_ALERT_MS);
+      expect(integrityCount()).toMatchObject({ total: before + 1, lastSig: "server:turnStalled" });
+      expect(error.mock.calls.filter((c) => String(c[0]).includes("turnStalled"))).toHaveLength(1);
+      vi.advanceTimersByTime(10 * 60_000);
+      expect(integrityCount().total).toBe(before + 1); // one report per stalled turn
+      // finalization semantics unchanged: the answer is still held and the
+      // next prompt still waits for a durable row
+      expect(h.r.provisional("s").map((i) => i.text)).toContain("FINAL ANSWER");
+      expect(h.r.beginTurn("s")).toBeUndefined();
+    } finally { error.mockRestore(); }
+  });
+
+  it("does not alarm when a row lands before the delay", () => {
+    vi.useFakeTimers();
+    const before = integrityCount().total;
+    const h = laggingTurn();
+    h.play();
+    h.feed("turn_end", {});
+    h.rows.push({ nodeId: 103, role: "agent" });
+    h.setTip(103);
+    h.r.onDurableChange(); // the closing row lands — the normal flip retires it
+    expect(h.r.provisional("s")).toEqual([]);
+    vi.advanceTimersByTime(TURN_STALL_ALERT_MS * 2);
+    expect(integrityCount().total).toBe(before);
+  });
+
+  it("does not alarm for a user-echo-only ending", () => {
+    vi.useFakeTimers();
+    const before = integrityCount().total;
+    const h = laggingTurn();
+    h.r.beginTurn("s");
+    h.feed("session_update", { sessionUpdate: "user_message", content: [{ type: "text", text: "q" }] });
+    h.feed("turn_end", {});
+    vi.advanceTimersByTime(TURN_STALL_ALERT_MS * 2);
+    expect(integrityCount().total).toBe(before);
+    expect(h.r.beginTurn("s")).toBeDefined(); // nothing to preserve — never blocked
+  });
+
+  it("forget before the delay silences the alarm", () => {
+    vi.useFakeTimers();
+    const before = integrityCount().total;
+    const h = laggingTurn();
+    h.play();
+    h.feed("turn_end", {});
+    h.r.forget("s");
+    expect(() => vi.advanceTimersByTime(TURN_STALL_ALERT_MS * 2)).not.toThrow();
+    expect(integrityCount().total).toBe(before);
+  });
+
+  it("alarms for an ended region restored without durable coverage", () => {
+    vi.useFakeTimers();
+    const before = integrityCount().total;
+    const h = laggingTurn({
+      turnId: "told", startNode: 100, ended: true,
+      items: [{ id: "p-told-1", kind: "text", role: "agent", text: "OLD ANSWER", done: true, seqFrom: 1, seqTo: 1 }],
+    });
+    expect(h.r.provisional("s").map((i) => i.text)).toContain("OLD ANSWER"); // triggers the restore
+    vi.advanceTimersByTime(TURN_STALL_ALERT_MS);
+    expect(integrityCount()).toMatchObject({ total: before + 1, lastSig: "server:turnStalled" });
+  });
+
+  it("does not alarm while the grace path owns a lagging closing row", () => {
+    vi.useFakeTimers();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const before = integrityCount().total;
+      const h = laggingTurn();
+      h.play();
+      h.setTip(102); // mid-turn rows durable — maxNode > turnStartNode
+      h.feed("turn_end", {});
+      vi.advanceTimersByTime(FINALIZE_GRACE_MS); // grace expires -> finalizeUnaligned flip
+      expect(integrityCount()).toMatchObject({ total: before + 1, lastSig: "server:finalizeUnaligned" });
+      vi.advanceTimersByTime(TURN_STALL_ALERT_MS);
+      expect(integrityCount().total).toBe(before + 1);
+      expect(error.mock.calls.filter((c) => String(c[0]).includes("turnStalled"))).toHaveLength(0);
+    } finally { error.mockRestore(); }
   });
 });
