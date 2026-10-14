@@ -18,7 +18,7 @@ import { maxNodeId, nodesAfter, openSessionsDb } from "../db";
 import { onSessionsDbChange, pokeSessionsDb } from "../transcriptWatch";
 import { readTranscriptItems, finalToolUpdates } from "../transcript-db";
 import { rowToItem } from "../transcript";
-import { readAllQueues, writeSessionQueue } from "../promptQueue";
+import { hydrateSessionQueue, writeSessionQueue } from "../promptQueue";
 import type { QueuedPrompt } from "../promptQueue";
 import type { TranscriptItem } from "../transcript";
 import type {
@@ -1333,7 +1333,7 @@ export class SessionManager {
 
   /** Queue a restarted web may still have on file but not yet attached. */
   private hydrateQueue(sessionId: string): QueuedPrompt[] {
-    return readAllQueues()[sessionId] ?? [];
+    return hydrateSessionQueue(sessionId);
   }
 
   /** Authoritative queue/running state for view hydration. */

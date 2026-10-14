@@ -73,9 +73,11 @@ function offloadBlocks(sid: string, qid: string, blocks: ContentBlock[], referen
   });
 }
 
-/** Restore `data` from `dataBlob` markers. An entry whose blob is missing or
- *  unreadable is dropped entirely — sending its text without the attachment
- *  would deliver a prompt the user never wrote. */
+/** Restore `data` from `dataBlob` markers. An entry whose blob is gone
+ *  (ENOENT) is dropped entirely — sending its text without the attachment
+ *  would deliver a prompt the user never wrote. Any other read failure
+ *  throws: a transiently unreadable blob must fail the whole load rather
+ *  than lose the entry on the next save. */
 function rehydrateEntry(e: QueuedPrompt): QueuedPrompt | null {
   const blocks: ContentBlock[] = [];
   for (const b of e.blocks) {
@@ -88,6 +90,7 @@ function rehydrateEntry(e: QueuedPrompt): QueuedPrompt | null {
     try {
       data = readFileSync(join(blobsDir(), name), "utf8");
     } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       console.error(`[promptQueue] unreadable blob ${name} — dropping queued prompt ${e.id}: ${(err as Error).message}`);
       return null;
     }
@@ -107,6 +110,22 @@ export interface QueuedPrompt {
 
 let cache: Record<string, QueuedPrompt[]> | null = null;
 let cacheMtime = -1;
+/** last load() could not read the queue (or a referenced blob) — writes
+ *  must not rename over a file we could not merge, nor sweep its blobs */
+let readFailed = false;
+let readFailLogged = false;
+
+/** The file (or a blob it references) exists but cannot be read. Keep the
+ *  last known-good cache, touch nothing on disk, and let every caller retry
+ *  on the next load. Logged once per failure streak. */
+function failRead(code: string): Record<string, QueuedPrompt[]> {
+  readFailed = true;
+  if (!readFailLogged) {
+    readFailLogged = true;
+    console.error(`[promptQueue] cannot read prompt-queue.json (${code}): queue changes are not persisted until it is readable`);
+  }
+  return cache ?? {};
+}
 
 function load(): Record<string, QueuedPrompt[]> {
   let mtime = -1;
@@ -115,11 +134,18 @@ function load(): Record<string, QueuedPrompt[]> {
   } catch {
     /* absent */
   }
-  if (cache && mtime === cacheMtime) return cache;
+  // while readFailed, the mtime shortcut must not mask a retry of the read.
+  // A permission/owner change does not move mtime either, but a warm cache
+  // is byte-for-byte what was last loaded — save() renaming over the file
+  // writes the same content plus this mutation, so nothing is lost.
+  if (cache && !readFailed && mtime === cacheMtime) return cache;
   let text: string | null = null;
   try {
     text = readFileSync(file(), "utf8");
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      return failRead(String((err as NodeJS.ErrnoException).code ?? (err as Error).message));
+    }
     text = null; // absent — an empty queue, nothing to preserve
   }
   const out: Record<string, QueuedPrompt[]> = {};
@@ -142,16 +168,22 @@ function load(): Record<string, QueuedPrompt[]> {
             typeof (e as QueuedPrompt).id === "string" &&
             Array.isArray((e as QueuedPrompt).blocks),
         );
-        const hydrated: QueuedPrompt[] = [];
-        for (const e of q) {
-          const h = rehydrateEntry(e);
-          if (h) hydrated.push(h);
+        try {
+          const hydrated: QueuedPrompt[] = [];
+          for (const e of q) {
+            const h = rehydrateEntry(e);
+            if (h) hydrated.push(h);
+          }
+          if (hydrated.length) out[k] = hydrated;
+        } catch (err) {
+          return failRead(String((err as NodeJS.ErrnoException).code ?? (err as Error).message));
         }
-        if (hydrated.length) out[k] = hydrated;
       }
     }
   }
   cache = out;
+  readFailed = false;
+  readFailLogged = false;
   try {
     cacheMtime = statSync(file()).mtimeMs;
   } catch {
@@ -196,9 +228,86 @@ function save(map: Record<string, QueuedPrompt[]>) {
   }
 }
 
+/** Snapshots of queue mutations made while the file was unreadable —
+ *  flushed by the next successful write or the retry timer. */
+const pendingWrites = new Map<string, QueuedPrompt[]>();
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let flushFailLogged = false;
+/** Sessions hydrated while the file was unreadable — they never saw their
+ *  disk entries, so the first write after recovery must reconcile. */
+const unhydrated = new Set<string>();
+/** Disk entries a recovering session never saw — held in front of its
+ *  snapshots so they persist (and run after the next restart) without being
+ *  resurrected by an in-memory drain. Never re-derived from disk. */
+const heldDisk = new Map<string, QueuedPrompt[]>();
+
+/** One re-check while the file stays unreadable — recovery must not depend
+ *  on another queue mutation arriving. */
+function armRetry() {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    try {
+      const map = { ...load() };
+      if (readFailed) {
+        armRetry();
+        return;
+      }
+      if (!pendingWrites.size) return;
+      for (const [sid, q] of pendingWrites) applySnapshot(map, sid, q);
+      const flushed = pendingWrites.size;
+      save(map);
+      console.error(`[promptQueue] persisted ${flushed} queue change(s) held while prompt-queue.json was unreadable`);
+      pendingWrites.clear();
+      flushFailLogged = false;
+    } catch (e) {
+      if (!flushFailLogged) {
+        flushFailLogged = true;
+        console.error(`[promptQueue] pending flush failed: ${(e as Error).message}`);
+      }
+      // the write itself failed (unwritable dir, full disk) — keep the
+      // snapshots and try again; a successful flush resets the streak log
+      if (pendingWrites.size) armRetry();
+    }
+  }, 5_000);
+  retryTimer.unref?.();
+}
+
+const snapshot = (queue: QueuedPrompt[]): QueuedPrompt[] =>
+  queue.map((q) => ({ id: q.id, blocks: q.blocks, ...(q.mentionEncoding === "uri" ? { mentionEncoding: "uri" as const } : {}) }));
+
+/** Merge one session's queue snapshot into the map being saved. Only called
+ *  when the load behind `map` succeeded (readFailed paths return early). */
+function applySnapshot(map: Record<string, QueuedPrompt[]>, sid: string, snap: QueuedPrompt[]) {
+  if (unhydrated.has(sid)) {
+    unhydrated.delete(sid);
+    const disk = map[sid] ?? [];
+    const ids = new Set(snap.map((q) => q.id));
+    const orphans = disk.filter((q) => !ids.has(q.id));
+    if (orphans.length) {
+      heldDisk.set(sid, orphans);
+      console.error(`[promptQueue] kept ${orphans.length} queued prompt(s) for ${sid} that were on disk while the file was unreadable; they run after the next web restart`);
+    }
+  }
+  const held = heldDisk.get(sid);
+  const value = held?.length ? [...held, ...snap] : snap;
+  if (value.length) map[sid] = value;
+  else delete map[sid];
+}
+
 /** Everything persisted — sessions hydrate their record from this at attach. */
 export function readAllQueues(): Record<string, QueuedPrompt[]> {
   return load();
+}
+
+/** A session's queue at attach. Hydrating while the file is unreadable
+ *  yields an empty queue — mark the session so the first write after
+ *  recovery reconciles against the disk entries it never saw instead of
+ *  overwriting them. */
+export function hydrateSessionQueue(sessionId: string): QueuedPrompt[] {
+  const map = load();
+  if (readFailed) unhydrated.add(sessionId);
+  return map[sessionId] ?? [];
 }
 
 /** Mirror the session's in-memory queue to disk — call after every mutation.
@@ -210,9 +319,26 @@ export function readAllQueues(): Record<string, QueuedPrompt[]> {
 export function writeSessionQueue(sessionId: string, queue: QueuedPrompt[]) {
   try {
     const map = { ...load() };
-    if (queue.length) map[sessionId] = queue.map((q) => ({ id: q.id, blocks: q.blocks, ...(q.mentionEncoding === "uri" ? { mentionEncoding: "uri" as const } : {}) }));
-    else delete map[sessionId];
+    // an unreadable queue file must not be renamed over or have its blobs
+    // swept — hold this snapshot and replay it once the file reads again
+    // (load already logged the streak)
+    if (readFailed) {
+      pendingWrites.set(sessionId, snapshot(queue));
+      armRetry();
+      return;
+    }
+    const flushed = pendingWrites.size;
+    for (const [sid, q] of pendingWrites) applySnapshot(map, sid, q);
+    const own = snapshot(queue);
+    // keep the newest snapshot until the write lands — a failed save must
+    // not strand it
+    pendingWrites.set(sessionId, own);
+    applySnapshot(map, sessionId, own);
     save(map);
+    if (flushed)
+      console.error(`[promptQueue] persisted ${flushed} queue change(s) held while prompt-queue.json was unreadable`);
+    pendingWrites.clear();
+    flushFailLogged = false;
   } catch (e) {
     console.error(`[promptQueue] persist failed for ${sessionId}: ${(e as Error).message}`);
   }
