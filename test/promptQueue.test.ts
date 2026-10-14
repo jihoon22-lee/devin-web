@@ -341,4 +341,37 @@ describe("lib/promptQueue", () => {
       rmSync(qfile(), { recursive: true, force: true });
     }
   });
+
+  it("re-arms the pending flush when the write itself fails, logging once per streak", async () => {
+    if (process.getuid?.() === 0) return;
+    const f = qfile();
+    writeFileSync(f, JSON.stringify({ "s-orig": [{ id: "q-orig", blocks: blk("orig") }] }));
+    const bytes = readFileSync(f);
+    vi.useFakeTimers();
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      chmodSync(f, 0o000);
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      cold.writeSessionQueue("s-held", [{ id: "q-h", blocks: blk("held") }]);
+      // readable file, unwritable dir — load() succeeds but save() fails
+      chmodSync(f, 0o600);
+      chmodSync(stateDir, 0o500);
+      vi.advanceTimersByTime(5_000);
+      expect(readFileSync(f)).toEqual(bytes); // flush failed; nothing written
+      expect(spy.mock.calls.filter((c) => String(c[0]).includes("pending flush failed"))).toHaveLength(1);
+      vi.advanceTimersByTime(10_000); // two more retries: still failing, still one log, timer re-armed
+      expect(spy.mock.calls.filter((c) => String(c[0]).includes("pending flush failed"))).toHaveLength(1);
+      chmodSync(stateDir, 0o700);
+      vi.advanceTimersByTime(5_000); // next retry proves the timer was still armed
+      const raw = JSON.parse(readFileSync(f, "utf8")) as Record<string, { id: string }[]>;
+      expect(Object.keys(raw)).toEqual(expect.arrayContaining(["s-orig", "s-held"]));
+      expect(spy.mock.calls.filter((c) => String(c[0]).includes("queue change(s) held"))).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+      vi.useRealTimers();
+      chmodSync(stateDir, 0o700);
+      if (existsSync(f)) chmodSync(f, 0o600);
+    }
+  });
 });

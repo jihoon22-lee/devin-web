@@ -232,6 +232,7 @@ function save(map: Record<string, QueuedPrompt[]>) {
  *  flushed by the next successful write or the retry timer. */
 const pendingWrites = new Map<string, QueuedPrompt[]>();
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let flushFailLogged = false;
 
 /** One re-check while the file stays unreadable — recovery must not depend
  *  on another queue mutation arriving. */
@@ -254,8 +255,15 @@ function armRetry() {
       save(map);
       console.error(`[promptQueue] persisted ${flushed} queue change(s) held while prompt-queue.json was unreadable`);
       pendingWrites.clear();
+      flushFailLogged = false;
     } catch (e) {
-      console.error(`[promptQueue] pending flush failed: ${(e as Error).message}`);
+      if (!flushFailLogged) {
+        flushFailLogged = true;
+        console.error(`[promptQueue] pending flush failed: ${(e as Error).message}`);
+      }
+      // the write itself failed (unwritable dir, full disk) — keep the
+      // snapshots and try again; a successful flush resets the streak log
+      if (pendingWrites.size) armRetry();
     }
   }, 5_000);
   retryTimer.unref?.();
@@ -298,6 +306,7 @@ export function writeSessionQueue(sessionId: string, queue: QueuedPrompt[]) {
     if (flushed)
       console.error(`[promptQueue] persisted ${flushed} queue change(s) held while prompt-queue.json was unreadable`);
     pendingWrites.clear();
+    flushFailLogged = false;
   } catch (e) {
     console.error(`[promptQueue] persist failed for ${sessionId}: ${(e as Error).message}`);
   }
