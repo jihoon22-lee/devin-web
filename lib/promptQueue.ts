@@ -134,7 +134,10 @@ function load(): Record<string, QueuedPrompt[]> {
   } catch {
     /* absent */
   }
-  // while readFailed, the mtime shortcut must not mask a retry of the read
+  // while readFailed, the mtime shortcut must not mask a retry of the read.
+  // A permission/owner change does not move mtime either, but a warm cache
+  // is byte-for-byte what was last loaded — save() renaming over the file
+  // writes the same content plus this mutation, so nothing is lost.
   if (cache && !readFailed && mtime === cacheMtime) return cache;
   let text: string | null = null;
   try {
@@ -225,6 +228,42 @@ function save(map: Record<string, QueuedPrompt[]>) {
   }
 }
 
+/** Snapshots of queue mutations made while the file was unreadable —
+ *  flushed by the next successful write or the retry timer. */
+const pendingWrites = new Map<string, QueuedPrompt[]>();
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** One re-check while the file stays unreadable — recovery must not depend
+ *  on another queue mutation arriving. */
+function armRetry() {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    try {
+      const map = { ...load() };
+      if (readFailed) {
+        armRetry();
+        return;
+      }
+      if (!pendingWrites.size) return;
+      for (const [sid, q] of pendingWrites) {
+        if (q.length) map[sid] = q;
+        else delete map[sid];
+      }
+      const flushed = pendingWrites.size;
+      save(map);
+      console.error(`[promptQueue] persisted ${flushed} queue change(s) held while prompt-queue.json was unreadable`);
+      pendingWrites.clear();
+    } catch (e) {
+      console.error(`[promptQueue] pending flush failed: ${(e as Error).message}`);
+    }
+  }, 5_000);
+  retryTimer.unref?.();
+}
+
+const snapshot = (queue: QueuedPrompt[]): QueuedPrompt[] =>
+  queue.map((q) => ({ id: q.id, blocks: q.blocks, ...(q.mentionEncoding === "uri" ? { mentionEncoding: "uri" as const } : {}) }));
+
 /** Everything persisted — sessions hydrate their record from this at attach. */
 export function readAllQueues(): Record<string, QueuedPrompt[]> {
   return load();
@@ -240,12 +279,25 @@ export function writeSessionQueue(sessionId: string, queue: QueuedPrompt[]) {
   try {
     const map = { ...load() };
     // an unreadable queue file must not be renamed over or have its blobs
-    // swept — the in-memory queue keeps working, only persistence pauses
+    // swept — hold this snapshot and replay it once the file reads again
     // (load already logged the streak)
-    if (readFailed) return;
-    if (queue.length) map[sessionId] = queue.map((q) => ({ id: q.id, blocks: q.blocks, ...(q.mentionEncoding === "uri" ? { mentionEncoding: "uri" as const } : {}) }));
+    if (readFailed) {
+      pendingWrites.set(sessionId, snapshot(queue));
+      armRetry();
+      return;
+    }
+    const flushed = pendingWrites.size;
+    for (const [sid, q] of pendingWrites) {
+      if (q.length) map[sid] = q;
+      else delete map[sid];
+    }
+    pendingWrites.delete(sessionId); // this call's mutation supersedes it
+    if (queue.length) map[sessionId] = snapshot(queue);
     else delete map[sessionId];
     save(map);
+    if (flushed)
+      console.error(`[promptQueue] persisted ${flushed} queue change(s) held while prompt-queue.json was unreadable`);
+    pendingWrites.clear();
   } catch (e) {
     console.error(`[promptQueue] persist failed for ${sessionId}: ${(e as Error).message}`);
   }

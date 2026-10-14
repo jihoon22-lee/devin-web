@@ -196,6 +196,7 @@ describe("lib/promptQueue", () => {
     rmSync(qfile(), { force: true });
     mkdirSync(qfile()); // a directory at the file path: EISDIR for any uid
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.useFakeTimers(); // the held-write retry stays fake — never fires mid-suite
     try {
       vi.resetModules();
       const cold = await import("../lib/promptQueue");
@@ -204,6 +205,137 @@ describe("lib/promptQueue", () => {
       cold.writeSessionQueue("s-z", [{ id: "q-z", blocks: blk("x") }]);
       const logs = spy.mock.calls.filter((c) => String(c[0]).includes("cannot read prompt-queue.json"));
       expect(logs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+      spy.mockRestore();
+      rmSync(qfile(), { recursive: true, force: true });
+    }
+  });
+
+  it("replays a queue change made while the file was unreadable on the next write", async () => {
+    if (process.getuid?.() === 0) return; // chmod 000 is a no-op for root
+    const f = qfile();
+    const img = { type: "image" as const, data: bigData, mimeType: "image/png" };
+    pq.writeSessionQueue("s-keep2", [{ id: "q-k2", blocks: [img] }]);
+    const blob = readdirSync(join(stateDir, "queue-blobs")).find((n) => n.startsWith("s-keep2--"))!;
+    vi.useFakeTimers();
+    try {
+      chmodSync(f, 0o000);
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      cold.writeSessionQueue("s-new", [{ id: "q-n", blocks: blk("held") }]);
+      chmodSync(f, 0o600);
+      cold.writeSessionQueue("s-other", [{ id: "q-o", blocks: blk("other") }]);
+      const raw = JSON.parse(readFileSync(f, "utf8")) as Record<string, { id: string }[]>;
+      expect(Object.keys(raw)).toEqual(expect.arrayContaining(["s-keep2", "s-new", "s-other"]));
+      expect(existsSync(join(stateDir, "queue-blobs", blob))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      if (existsSync(f)) chmodSync(f, 0o600);
+    }
+  });
+
+  it("flushes held changes on the retry timer without another mutation", async () => {
+    if (process.getuid?.() === 0) return;
+    const f = qfile();
+    writeFileSync(f, JSON.stringify({ "s-orig": [{ id: "q-orig", blocks: blk("orig") }] }));
+    vi.useFakeTimers();
+    try {
+      chmodSync(f, 0o000);
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      cold.writeSessionQueue("s-held", [{ id: "q-h", blocks: blk("held") }]);
+      chmodSync(f, 0o600);
+      vi.advanceTimersByTime(5_000);
+      const raw = JSON.parse(readFileSync(f, "utf8")) as Record<string, { id: string }[]>;
+      expect(Object.keys(raw)).toEqual(expect.arrayContaining(["s-orig", "s-held"]));
+      const all = cold.readAllQueues();
+      expect(all["s-orig"]?.[0]?.blocks).toEqual(blk("orig"));
+      expect(all["s-held"]?.[0]?.blocks).toEqual(blk("held"));
+    } finally {
+      vi.useRealTimers();
+      if (existsSync(f)) chmodSync(f, 0o600);
+    }
+  });
+
+  it("a session drained while unreadable stays drained after the flush", async () => {
+    if (process.getuid?.() === 0) return;
+    const f = qfile();
+    const img = { type: "image" as const, data: bigData, mimeType: "image/png" };
+    pq.writeSessionQueue("s-old", [{ id: "q-old", blocks: [img] }]);
+    const blob = readdirSync(join(stateDir, "queue-blobs")).find((n) => n.startsWith("s-old--"))!;
+    vi.useFakeTimers();
+    try {
+      chmodSync(f, 0o000);
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      cold.writeSessionQueue("s-old", []); // drained in memory while unreadable
+      chmodSync(f, 0o600);
+      cold.writeSessionQueue("s-x", [{ id: "q-x", blocks: blk("x") }]);
+      const raw = JSON.parse(readFileSync(f, "utf8")) as Record<string, { id: string }[]>;
+      expect(raw["s-old"]).toBeUndefined();
+      expect(existsSync(join(stateDir, "queue-blobs", blob))).toBe(false); // swept normally
+      expect(raw["s-x"]?.[0]?.id).toBe("q-x");
+    } finally {
+      vi.useRealTimers();
+      if (existsSync(f)) chmodSync(f, 0o600);
+    }
+  });
+
+  it("re-arms the retry while the file stays unreadable and flushes once readable", async () => {
+    if (process.getuid?.() === 0) return;
+    const f = qfile();
+    writeFileSync(f, JSON.stringify({ "s-orig": [{ id: "q-orig", blocks: blk("orig") }] }));
+    const bytes = readFileSync(f);
+    vi.useFakeTimers();
+    try {
+      chmodSync(f, 0o000);
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      cold.writeSessionQueue("s-held", [{ id: "q-h", blocks: blk("held") }]);
+      vi.advanceTimersByTime(5_000); // first retry: still unreadable → re-armed
+      chmodSync(f, 0o600);
+      expect(readFileSync(f)).toEqual(bytes); // nothing flushed yet
+      vi.advanceTimersByTime(5_000); // second retry: flushed
+      const raw = JSON.parse(readFileSync(f, "utf8")) as Record<string, { id: string }[]>;
+      expect(Object.keys(raw)).toEqual(expect.arrayContaining(["s-orig", "s-held"]));
+    } finally {
+      vi.useRealTimers();
+      if (existsSync(f)) chmodSync(f, 0o600);
+    }
+  });
+
+  it("a warm cache and an unchanged mtime may write through a permission change", async () => {
+    if (process.getuid?.() === 0) return;
+    const f = qfile();
+    const img = { type: "image" as const, data: bigData, mimeType: "image/png" };
+    pq.writeSessionQueue("s-w1", [{ id: "q-w1", blocks: blk("one") }]);
+    pq.writeSessionQueue("s-w2", [{ id: "q-w2", blocks: [img] }]);
+    const blob = readdirSync(join(stateDir, "queue-blobs")).find((n) => n.startsWith("s-w2--"))!;
+    pq.readAllQueues(); // warm the mtime cache
+    try {
+      chmodSync(f, 0o000); // mtime unchanged — the cache is exactly the file's content
+      pq.writeSessionQueue("s-new", [{ id: "q-n", blocks: blk("new") }]);
+      // the rename wrote a fresh readable file: nothing was lost
+      const raw = JSON.parse(readFileSync(f, "utf8")) as Record<string, { id: string }[]>;
+      expect(Object.keys(raw)).toEqual(expect.arrayContaining(["s-w1", "s-w2", "s-new"]));
+      expect(existsSync(join(stateDir, "queue-blobs", blob))).toBe(true);
+    } finally {
+      if (existsSync(f)) chmodSync(f, 0o600);
+    }
+  });
+
+  it("the retry timer is unref'd so it cannot hold the process open", async () => {
+    rmSync(qfile(), { force: true });
+    mkdirSync(qfile()); // EISDIR, works for any uid
+    const spy = vi.spyOn(globalThis, "setTimeout");
+    try {
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      cold.writeSessionQueue("s-t", [{ id: "q-t", blocks: blk("x") }]);
+      const handle = spy.mock.results.at(-1)?.value as NodeJS.Timeout | undefined;
+      expect(handle?.hasRef?.()).toBe(false);
+      if (handle) clearTimeout(handle);
     } finally {
       spy.mockRestore();
       rmSync(qfile(), { recursive: true, force: true });
