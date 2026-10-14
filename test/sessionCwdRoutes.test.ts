@@ -5,12 +5,13 @@ import { join } from "node:path";
 
 const live = vi.hoisted(() => ({
   recorded: new Map<string, string>(),
+  active: new Map<string, { cwd: string; cwdUnknown?: boolean }>(),
   loads: [] as [string, string][],
   forks: [] as [string, string][],
 }));
 vi.mock("@/lib/state", () => ({
   manager: () => ({
-    getSession: () => undefined,
+    getSession: (id: string) => live.active.get(id),
     listSessions: async () => [...live.recorded].map(([sessionId, cwd]) => ({ sessionId, cwd })),
     loadSession: async (id: string, cwd: string) => { live.loads.push([id, cwd]); return { sessionId: id }; },
     fork: async (id: string, cwd: string) => { live.forks.push([id, cwd]); return { sessionId: `${id}-fork` }; },
@@ -35,7 +36,7 @@ const post = (body: object) => new Request("http://localhost/x", { method: "POST
 const ctx = (id: string) => ({ params: Promise.resolve({ id }) });
 
 beforeEach(() => {
-  live.recorded.clear(); live.loads.length = 0; live.forks.length = 0;
+  live.recorded.clear(); live.active.clear(); live.loads.length = 0; live.forks.length = 0;
   setFsRootsForTest([allowed]);
 });
 
@@ -75,6 +76,46 @@ describe("caller-supplied cwd on existing sessions (L1)", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const res = await fork.POST(post({ cwd: join(allowed, "proj") }) as any, ctx("parent"));
     expect(res.status).toBe(200);
+  });
+
+  it("load: an adopted session's placeholder cwd is ignored in favor of the recorded cwd", async () => {
+    const placeholder = join(dir, "placeholder-default");
+    live.active.set("adopted", { cwd: placeholder, cwdUnknown: true });
+    live.recorded.set("adopted", outside);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res = await load.POST(post({ cwd: outside }) as any, ctx("adopted"));
+    expect(res.status).toBe(200);
+    expect(live.loads).toEqual([["adopted", outside]]);
+  });
+
+  it("load: the placeholder itself is not accepted as the session's own cwd", async () => {
+    const placeholder = join(dir, "placeholder-default");
+    live.active.set("adopted", { cwd: placeholder, cwdUnknown: true });
+    live.recorded.set("adopted", outside);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res = await load.POST(post({ cwd: placeholder }) as any, ctx("adopted"));
+    expect(res.status).toBe(403);
+    expect(live.loads).toEqual([]);
+  });
+
+  it("takeover: an adopted session's placeholder cwd is ignored in favor of the recorded cwd", async () => {
+    const placeholder = join(dir, "placeholder-default");
+    live.active.set("adopted", { cwd: placeholder, cwdUnknown: true });
+    live.recorded.set("adopted", outside);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res = await takeover.POST(post({ cwd: outside }) as any, ctx("adopted"));
+    expect(res.status).toBe(200);
+    expect(live.loads).toEqual([["adopted", outside]]);
+  });
+
+  it("fork: an adopted session's placeholder cwd is ignored in favor of the recorded cwd", async () => {
+    const placeholder = join(dir, "placeholder-default");
+    live.active.set("adopted", { cwd: placeholder, cwdUnknown: true });
+    live.recorded.set("adopted", outside);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res = await fork.POST(post({ cwd: outside }) as any, ctx("adopted"));
+    expect(res.status).toBe(200);
+    expect(live.forks).toEqual([["adopted", outside]]);
   });
 
   it("unset roots keep today's unrestricted behavior", async () => {
