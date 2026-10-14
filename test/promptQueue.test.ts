@@ -374,4 +374,108 @@ describe("lib/promptQueue", () => {
       if (existsSync(f)) chmodSync(f, 0o600);
     }
   });
+
+  const qids = (f: string, sid: string) =>
+    (JSON.parse(readFileSync(f, "utf8")) as Record<string, { id: string }[]>)[sid]?.map((q) => q.id);
+
+  it("keeps on-disk prompts for a session hydrated while the file was unreadable", async () => {
+    if (process.getuid?.() === 0) return;
+    const f = qfile();
+    writeFileSync(f, JSON.stringify({
+      "s-a": [{ id: "orig1", blocks: blk("orig1") }],
+      "s-other": [{ id: "o", blocks: blk("o") }],
+    }));
+    vi.useFakeTimers();
+    try {
+      chmodSync(f, 0o000);
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      expect(cold.hydrateSessionQueue("s-a")).toEqual([]); // unreadable → empty, marked
+      chmodSync(f, 0o600);
+      cold.writeSessionQueue("s-a", [{ id: "new1", blocks: blk("new1") }]);
+      expect(qids(f, "s-a")).toEqual(["orig1", "new1"]); // disk orphan preserved in front
+      expect(qids(f, "s-other")).toEqual(["o"]);
+      cold.writeSessionQueue("s-a", []); // new1 drained in memory
+      expect(qids(f, "s-a")).toEqual(["orig1"]); // drained snapshot is not resurrected
+      cold.writeSessionQueue("s-a", [{ id: "new2", blocks: blk("new2") }]);
+      expect(qids(f, "s-a")).toEqual(["orig1", "new2"]);
+    } finally {
+      vi.useRealTimers();
+      if (existsSync(f)) chmodSync(f, 0o600);
+    }
+  });
+
+  it("a session not hydrated under failure keeps normal drain semantics", async () => {
+    if (process.getuid?.() === 0) return;
+    const f = qfile();
+    writeFileSync(f, JSON.stringify({ "s-c": [{ id: "c1", blocks: blk("c1") }] }));
+    vi.useFakeTimers();
+    try {
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      // hydrated while the file is still readable → not marked
+      expect(cold.hydrateSessionQueue("s-c")).toEqual([{ id: "c1", blocks: blk("c1") }]);
+      chmodSync(f, 0o000);
+      cold.writeSessionQueue("s-c", [{ id: "c1", blocks: blk("c1") }, { id: "c2", blocks: blk("c2") }]);
+      chmodSync(f, 0o600);
+      vi.advanceTimersByTime(5_000); // flush the held snapshot
+      expect(qids(f, "s-c")).toEqual(["c1", "c2"]);
+      cold.writeSessionQueue("s-c", []); // drain removes everything — nothing held
+      expect(qids(f, "s-c")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      if (existsSync(f)) chmodSync(f, 0o600);
+    }
+  });
+
+  it("reconciles held-on-disk prompts when recovery is flushed by the retry timer", async () => {
+    if (process.getuid?.() === 0) return;
+    const f = qfile();
+    writeFileSync(f, JSON.stringify({ "s-t2": [{ id: "orig", blocks: blk("orig") }] }));
+    vi.useFakeTimers();
+    try {
+      chmodSync(f, 0o000);
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      expect(cold.hydrateSessionQueue("s-t2")).toEqual([]);
+      cold.writeSessionQueue("s-t2", [{ id: "held", blocks: blk("held") }]);
+      chmodSync(f, 0o600);
+      vi.advanceTimersByTime(5_000); // flush through applySnapshot — orig preserved first
+      expect(qids(f, "s-t2")).toEqual(["orig", "held"]);
+    } finally {
+      vi.useRealTimers();
+      if (existsSync(f)) chmodSync(f, 0o600);
+    }
+  });
+
+  it("a failed save keeps the NEWEST snapshot for the session", async () => {
+    if (process.getuid?.() === 0) return;
+    const f = qfile();
+    writeFileSync(f, JSON.stringify({ "s-x": [{ id: "x0", blocks: blk("x0") }] }));
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.useFakeTimers();
+    try {
+      chmodSync(f, 0o000);
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      // cold module: the first read fails → the write is held, not written
+      cold.writeSessionQueue("s-x", [{ id: "x0", blocks: blk("x0") }, { id: "n1", blocks: blk("n1") }]);
+      // file readable, dir unwritable → the flush's save() fails and re-arms
+      chmodSync(f, 0o600);
+      chmodSync(stateDir, 0o500);
+      vi.advanceTimersByTime(5_000);
+      expect(qids(f, "s-x")).toEqual(["x0"]);
+      // a newer mutation also fails to save — it must replace the held one
+      cold.writeSessionQueue("s-x", [{ id: "x0", blocks: blk("x0") }, { id: "n2", blocks: blk("n2") }]);
+      expect(qids(f, "s-x")).toEqual(["x0"]);
+      chmodSync(stateDir, 0o700);
+      vi.advanceTimersByTime(5_000);
+      expect(qids(f, "s-x")).toEqual(["x0", "n2"]); // newest snapshot, not n1, not lost
+    } finally {
+      vi.useRealTimers();
+      spy.mockRestore();
+      chmodSync(stateDir, 0o700);
+      if (existsSync(f)) chmodSync(f, 0o600);
+    }
+  });
 });

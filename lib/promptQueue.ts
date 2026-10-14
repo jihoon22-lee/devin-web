@@ -233,6 +233,13 @@ function save(map: Record<string, QueuedPrompt[]>) {
 const pendingWrites = new Map<string, QueuedPrompt[]>();
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let flushFailLogged = false;
+/** Sessions hydrated while the file was unreadable — they never saw their
+ *  disk entries, so the first write after recovery must reconcile. */
+const unhydrated = new Set<string>();
+/** Disk entries a recovering session never saw — held in front of its
+ *  snapshots so they persist (and run after the next restart) without being
+ *  resurrected by an in-memory drain. Never re-derived from disk. */
+const heldDisk = new Map<string, QueuedPrompt[]>();
 
 /** One re-check while the file stays unreadable — recovery must not depend
  *  on another queue mutation arriving. */
@@ -247,10 +254,7 @@ function armRetry() {
         return;
       }
       if (!pendingWrites.size) return;
-      for (const [sid, q] of pendingWrites) {
-        if (q.length) map[sid] = q;
-        else delete map[sid];
-      }
+      for (const [sid, q] of pendingWrites) applySnapshot(map, sid, q);
       const flushed = pendingWrites.size;
       save(map);
       console.error(`[promptQueue] persisted ${flushed} queue change(s) held while prompt-queue.json was unreadable`);
@@ -272,9 +276,38 @@ function armRetry() {
 const snapshot = (queue: QueuedPrompt[]): QueuedPrompt[] =>
   queue.map((q) => ({ id: q.id, blocks: q.blocks, ...(q.mentionEncoding === "uri" ? { mentionEncoding: "uri" as const } : {}) }));
 
+/** Merge one session's queue snapshot into the map being saved. Only called
+ *  when the load behind `map` succeeded (readFailed paths return early). */
+function applySnapshot(map: Record<string, QueuedPrompt[]>, sid: string, snap: QueuedPrompt[]) {
+  if (unhydrated.has(sid)) {
+    unhydrated.delete(sid);
+    const disk = map[sid] ?? [];
+    const ids = new Set(snap.map((q) => q.id));
+    const orphans = disk.filter((q) => !ids.has(q.id));
+    if (orphans.length) {
+      heldDisk.set(sid, orphans);
+      console.error(`[promptQueue] kept ${orphans.length} queued prompt(s) for ${sid} that were on disk while the file was unreadable; they run after the next web restart`);
+    }
+  }
+  const held = heldDisk.get(sid);
+  const value = held?.length ? [...held, ...snap] : snap;
+  if (value.length) map[sid] = value;
+  else delete map[sid];
+}
+
 /** Everything persisted — sessions hydrate their record from this at attach. */
 export function readAllQueues(): Record<string, QueuedPrompt[]> {
   return load();
+}
+
+/** A session's queue at attach. Hydrating while the file is unreadable
+ *  yields an empty queue — mark the session so the first write after
+ *  recovery reconciles against the disk entries it never saw instead of
+ *  overwriting them. */
+export function hydrateSessionQueue(sessionId: string): QueuedPrompt[] {
+  const map = load();
+  if (readFailed) unhydrated.add(sessionId);
+  return map[sessionId] ?? [];
 }
 
 /** Mirror the session's in-memory queue to disk — call after every mutation.
@@ -295,13 +328,12 @@ export function writeSessionQueue(sessionId: string, queue: QueuedPrompt[]) {
       return;
     }
     const flushed = pendingWrites.size;
-    for (const [sid, q] of pendingWrites) {
-      if (q.length) map[sid] = q;
-      else delete map[sid];
-    }
-    pendingWrites.delete(sessionId); // this call's mutation supersedes it
-    if (queue.length) map[sessionId] = snapshot(queue);
-    else delete map[sessionId];
+    for (const [sid, q] of pendingWrites) applySnapshot(map, sid, q);
+    const own = snapshot(queue);
+    // keep the newest snapshot until the write lands — a failed save must
+    // not strand it
+    pendingWrites.set(sessionId, own);
+    applySnapshot(map, sessionId, own);
     save(map);
     if (flushed)
       console.error(`[promptQueue] persisted ${flushed} queue change(s) held while prompt-queue.json was unreadable`);
