@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 
 const stateDir = mkdtempSync(join(tmpdir(), "dw-pq-state-"));
 process.env.DEVIN_WEB_STATE_DIR = stateDir;
@@ -129,5 +129,84 @@ describe("lib/promptQueue", () => {
       ],
     }));
     expect(coldRead()["s-miss"]?.map((e) => e.id)).toEqual(["q-ok"]);
+  });
+
+  it("an unreadable queue file is left untouched and persistence pauses until it is readable again", async () => {
+    if (process.getuid?.() === 0) return; // chmod 000 is a no-op for root
+    const f = qfile();
+    const img = { type: "image" as const, data: bigData, mimeType: "image/png" };
+    pq.writeSessionQueue("s-old", [{ id: "q-old", blocks: blk("keep me") }]);
+    pq.writeSessionQueue("s-img2", [{ id: "q-img2", blocks: [img] }]);
+    const blob = readdirSync(join(stateDir, "queue-blobs")).find((n) => n.startsWith("s-img2--"))!;
+    const bytes = readFileSync(f);
+    try {
+      chmodSync(f, 0o000);
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      // cold start: unreadable file reads as empty, no quarantine, no write
+      expect(cold.readAllQueues()).toEqual({});
+      expect(quarantined()).toHaveLength(0);
+      cold.writeSessionQueue("s-new", [{ id: "q-n", blocks: blk("lost?") }]);
+      expect(existsSync(join(stateDir, "queue-blobs", blob))).toBe(true);
+      chmodSync(f, 0o600);
+      expect(readFileSync(f)).toEqual(bytes); // the unreadable file was never renamed over
+      // readable again → the next mutation merges with the existing sessions
+      cold.writeSessionQueue("s-new2", [{ id: "q-n2", blocks: blk("now") }]);
+      const raw = JSON.parse(readFileSync(f, "utf8")) as Record<string, { id: string }[]>;
+      expect(Object.keys(raw)).toEqual(expect.arrayContaining(["s-old", "s-img2", "s-new2"]));
+      expect(existsSync(join(stateDir, "queue-blobs", blob))).toBe(true);
+      const all = cold.readAllQueues();
+      expect(all["s-old"]?.[0]?.blocks).toEqual(blk("keep me"));
+      expect(all["s-img2"]?.[0]?.blocks).toEqual([img]);
+    } finally {
+      if (existsSync(f)) chmodSync(f, 0o600);
+    }
+  });
+
+  it("a transiently unreadable blob fails the whole load without dropping the entry or sweeping", async () => {
+    writeFileSync(qfile(), JSON.stringify({
+      "s-dir": [{ id: "q-dir", blocks: [{ type: "image", mimeType: "image/png", dataBlob: "blobdir" }] }],
+    }));
+    const blobPath = join(stateDir, "queue-blobs", "blobdir");
+    mkdirSync(blobPath, { recursive: true }); // EISDIR — works for any uid
+    try {
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      const bytes = readFileSync(qfile());
+      expect(cold.readAllQueues()).toEqual({});
+      expect(quarantined()).toHaveLength(0);
+      cold.writeSessionQueue("s-x", [{ id: "q-x", blocks: blk("nope") }]);
+      expect(readFileSync(qfile())).toEqual(bytes); // file not rewritten
+      expect(existsSync(blobPath)).toBe(true);
+      // restore the blob → the entry hydrates again and survives the save
+      rmSync(blobPath, { recursive: true, force: true });
+      writeFileSync(blobPath, "blobdata");
+      cold.writeSessionQueue("s-y", [{ id: "q-y", blocks: blk("now") }]);
+      const all = cold.readAllQueues();
+      expect(all["s-dir"]?.[0]?.blocks).toEqual([{ type: "image", mimeType: "image/png", data: "blobdata" }]);
+      const raw = JSON.parse(readFileSync(qfile(), "utf8")) as Record<string, { id: string }[]>;
+      expect(raw["s-dir"]?.[0]?.id).toBe("q-dir");
+      expect(raw["s-y"]?.[0]?.id).toBe("q-y");
+    } finally {
+      rmSync(blobPath, { recursive: true, force: true });
+    }
+  });
+
+  it("logs the read failure once per streak, not per call", async () => {
+    rmSync(qfile(), { force: true });
+    mkdirSync(qfile()); // a directory at the file path: EISDIR for any uid
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      vi.resetModules();
+      const cold = await import("../lib/promptQueue");
+      cold.readAllQueues();
+      cold.readAllQueues();
+      cold.writeSessionQueue("s-z", [{ id: "q-z", blocks: blk("x") }]);
+      const logs = spy.mock.calls.filter((c) => String(c[0]).includes("cannot read prompt-queue.json"));
+      expect(logs).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+      rmSync(qfile(), { recursive: true, force: true });
+    }
   });
 });

@@ -100,7 +100,7 @@ The CLI owns `$DEVIN_CLI_DIR/sessions.db`, its sidecars, and session artifacts. 
 | `search.db`, `treecache.db` | Rebuildable search/tree caches, still containing private source data |
 | Logs, sockets, pidfiles, status and disable markers | Runtime operations; do not restore stale sockets or pidfiles as live state |
 
-If `prompt-queue.json` stops parsing, the web moves it to `prompt-queue.json.corrupt-<ms>` and keeps every file in `queue-blobs/` until no such file remains; recover the entries you need, then delete the set-aside file.
+If `prompt-queue.json` stops parsing, the web moves it to `prompt-queue.json.corrupt-<ms>` and keeps every file in `queue-blobs/` until no such file remains; recover the entries you need, then delete the set-aside file. If `prompt-queue.json` exists but cannot be read (permissions, an I/O error), the web instead leaves it and `queue-blobs/` untouched, logs `[promptQueue] cannot read prompt-queue.json`, and does not persist queue changes until it is readable — queued prompts still run from memory, and each read retries so fixing ownership/permissions needs no restart.
 
 Also preserve project repositories and their linked worktree metadata, and any CLI configuration you need to recover. Worktrees are tied to their source Git repositories; copying only the worktree directory is not a portable repository backup.
 
