@@ -11,6 +11,14 @@ import { noteIntegrityBeacon } from "../integrityBeacon";
  *  (e.g. the CLI merging two messages) must never park the queue forever. */
 export const FINALIZE_GRACE_MS = 5_000;
 
+/** An ended turn whose region has substantive content but no durable row
+ *  since its start never reaches the finalize path — onDurableChange gates
+ *  on maxNode > turnStartNode — so its hold on the prompt queue is
+ *  unbounded. Alarm after this long; finalization itself is unchanged: the
+ *  turn still releases only when a durable row lands (or the session goes
+ *  away). */
+export const TURN_STALL_ALERT_MS = 30_000;
+
 export interface TurnRegionStorage {
   restore(sessionId: string): { turnId: string; startNode: number; ended: boolean; items: AssembledItem[] } | null;
   loadRetained(sessionId: string): AssembledItem[];
@@ -53,6 +61,15 @@ const CONTENT_UPDATES = new Set([
   "plan",
 ]);
 
+/** Content a turn boundary must not drop — also the bar for a stall
+ *  alarm: an ended region holding none of these may retire without a
+ *  commit and never blocks the queue. */
+const substantive = (items: AssembledItem[]) =>
+  items.some((item) =>
+    item.kind === "plan" || item.kind === "tool" ||
+    (item.kind === "text" && (item.role === "agent" || item.role === "thought")),
+  );
+
 export class TurnRegions {
   constructor(private readonly deps: TurnRegionDeps, private readonly runId: string) {}
 
@@ -64,6 +81,10 @@ export class TurnRegions {
   >();
   /** one pending grace re-check per session (see FINALIZE_GRACE_MS) */
   private graceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** one pending stall alarm per session (see TURN_STALL_ALERT_MS) */
+  private stallTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** turn ids already reported stalled — one beacon per stalled turn */
+  private stallReported = new Set<string>();
   private turnSeq = 0;
   private failedFinalizations = new Map<string, string>();
   /** sessions whose provisional region changed since the last flush */
@@ -234,6 +255,34 @@ export class TurnRegions {
     this.graceTimers.set(sid, timer);
   }
 
+  private clearStall(sid: string) {
+    const timer = this.stallTimers.get(sid);
+    if (timer) clearTimeout(timer);
+    this.stallTimers.delete(sid);
+  }
+
+  /** Arm the stall alarm for an ended region. The timer only reports —
+   *  it never finalizes, writes, or otherwise changes lifecycle. */
+  private watchStall(sid: string) {
+    if (this.stallTimers.has(sid)) return;
+    const ps = this.prov.get(sid);
+    if (!ps || !ps.ended || this.stallReported.has(ps.turnId)) return;
+    const turnId = ps.turnId;
+    const timer = setTimeout(() => {
+      this.stallTimers.delete(sid);
+      const cur = this.prov.get(sid);
+      if (!cur || cur.turnId !== turnId || !cur.ended) return;
+      // rows landed since the turn's start — the finalize/grace path owns it
+      if (this.deps.maxNode(sid) > cur.turnStartNode) return;
+      if (!substantive(cur.asm.list())) return;
+      this.stallReported.add(cur.turnId);
+      noteIntegrityBeacon("server:turnStalled");
+      console.error(`[integrity] ${sid} turnStalled ${cur.turnId} — ended without any durable row since node ${cur.turnStartNode}; the next prompt waits until one lands`);
+    }, TURN_STALL_ALERT_MS);
+    timer.unref?.();
+    this.stallTimers.set(sid, timer);
+  }
+
   /** sessions.db committed: an ended turn whose start is now covered by
    *  durable rows is dropped wholesale — the durable region replaces it.
    *  Counterpart-less items survive as anchored retained items. */
@@ -247,6 +296,8 @@ export class TurnRegions {
         const grace = this.graceTimers.get(sid);
         if (grace) clearTimeout(grace);
         this.graceTimers.delete(sid);
+        this.clearStall(sid);
+        this.stallReported.delete(ps.turnId);
         this.prov.delete(sid);
         dropped = true;
         const regions = {
@@ -282,10 +333,7 @@ export class TurnRegions {
       // Retry even without a failed write: a new turn sharing this start node
       // would erase the old ephemera and align new content to the old rows.
       this.onDurableChange();
-      if (this.prov.get(sessionId) === previous && previous.asm.list().some(item =>
-        item.kind === "plan" || item.kind === "tool" ||
-        (item.kind === "text" && (item.role === "agent" || item.role === "thought")),
-      )) {
+      if (this.prov.get(sessionId) === previous && substantive(previous.asm.list())) {
         // Preserve the latest closed state before the coalesced flush, too.
         // Error/cancel is not proof that no later durable write can arrive.
         this.deps.storage.save(sessionId, previous.turnId, previous.turnStartNode, previous.asm.list(), true);
@@ -293,6 +341,10 @@ export class TurnRegions {
       }
       // Empty and user-echo-only failures may never produce durable rows.
       // They have no agent content to recover and must not block the queue.
+    }
+    if (previous) {
+      this.clearStall(sessionId);
+      this.stallReported.delete(previous.turnId);
     }
     this.failedFinalizations.delete(sessionId);
     // runId makes the turn id unique across web restarts — itemlog rows are
@@ -347,6 +399,9 @@ export class TurnRegions {
       turnStartNode: r.startNode,
       ended: r.ended,
     });
+    // an ended region restored without coverage waits indefinitely for a
+    // durable row — watch it like a live ending
+    if (r.ended) this.watchStall(sessionId);
     this.deps.watchDurable();
     this.scheduleProvFlush(sessionId);
   }
@@ -389,7 +444,7 @@ export class TurnRegions {
       if (!ps.asm.list().length) {
         this.prov.delete(sid);
         this.deps.storage.drop(sid, ps.turnId);
-      }
+      } else this.watchStall(sid);
       // the turn's durable commits may already have landed (they were
       // skipped while ended=false) — re-run the flip check now or the
       // region waits for the NEXT session's commit to retire
@@ -406,6 +461,7 @@ export class TurnRegions {
         ps.asm.closeAll();
         ps.ended = true;
         ps.endedAt = Date.now();
+        this.watchStall(sid);
         this.onDurableChange(); // durable commits may have pre-landed
         this.scheduleProvFlush(sid);
       }
@@ -452,6 +508,9 @@ export class TurnRegions {
     const grace = this.graceTimers.get(sessionId);
     if (grace) clearTimeout(grace);
     this.graceTimers.delete(sessionId);
+    this.clearStall(sessionId);
+    const ps = this.prov.get(sessionId);
+    if (ps) this.stallReported.delete(ps.turnId);
     this.failedFinalizations.delete(sessionId);
     this.deps.invalidateDurable(sessionId);
     this.prov.delete(sessionId);
