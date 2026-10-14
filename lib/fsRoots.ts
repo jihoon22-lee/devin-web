@@ -1,11 +1,14 @@
-import { resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import { openSessionsDb } from "./db";
+import { pathInRoots } from "./acp/fsGate.mjs";
 
 /** Optional filesystem allowlist. When DEVIN_WEB_FS_ROOTS is set to a
- *  comma-separated list of directories, the browser fs routes and the ACP
- *  fs/read_text_file|write_text_file handlers only serve paths inside those
- *  roots. Unset → everything allowed (the default — the local file browser
- *  legitimately needs the whole tree; the request guard is the boundary).
+ *  comma-separated list of directories, the browser fs routes only serve
+ *  paths inside those roots (plus every session's cwd); agent fs requests
+ *  use the stricter lib/acp/fsGate.mjs rule — roots plus the requesting
+ *  session's own cwd. Unset → everything allowed (the default — the local
+ *  file browser legitimately needs the whole tree; the request guard is the
+ *  boundary).
  *  Note: this is lexical (resolve()) — a symlink inside a root that points
  *  outside it still passes. realpath-ing every request would be safer but
  *  costs a syscall per call; acceptable since the list is opt-in and the
@@ -30,11 +33,15 @@ export function configuredRoots(): readonly string[] {
   return roots;
 }
 
-export function pathInRoots(path: string, rootList: readonly string[]): boolean {
-  if (!rootList.length) return true;
-  const p = resolve(path);
-  return rootList.some((r) => p === r || p.startsWith(r + sep));
+/** Gate for a caller-supplied session cwd: a session's cwd later widens
+ *  browser fs access (sessionRoots) and the agent fs gate, so while
+ *  DEVIN_WEB_FS_ROOTS is configured it must lie inside it. Returns the 403
+ *  message, or null when allowed. */
+export function cwdRootsError(dir: string): string | null {
+  return roots.length > 0 && !pathInRoots(dir, roots) ? `cwd outside DEVIN_WEB_FS_ROOTS: ${dir}` : null;
 }
+
+export { pathInRoots };
 
 /** Session working directories are always browsable — a session's own
  *  project is legitimate file-browser territory even when DEVIN_WEB_FS_ROOTS

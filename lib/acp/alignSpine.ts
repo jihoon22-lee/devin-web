@@ -22,7 +22,7 @@ export interface DurableSpineRow {
   toolCallId?: string;
 }
 
-const isSpine = (i: AssembledItem): boolean =>
+export const isSpine = (i: AssembledItem): boolean =>
   (i.kind === "text" && (i.role === "user" || i.role === "agent")) ||
   i.kind === "tool";
 
@@ -67,7 +67,7 @@ export function computeAnchors(
   durableRows: DurableSpineRow[],
   turnStartNode: number,
   turnEndNode: number,
-): { anchors: Map<string, number>; violations: string[] } {
+): { anchors: Map<string, number>; violations: string[]; aligned: Map<string, number> } {
   const aligned = alignSpine(provItems, durableRows);
   const anchors = new Map<string, number>();
   const violations: string[] = [];
@@ -83,5 +83,5 @@ export function computeAnchors(
       anchors.set(it.id, last);
     }
   }
-  return { anchors, violations };
+  return { anchors, violations, aligned };
 }

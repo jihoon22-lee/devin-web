@@ -566,6 +566,28 @@ describe("cancel / exit pending-request cleanup (2-5, 2-6)", () => {
     emitted.mockRestore();
   });
 
+  it("sendQueuedNow failing because the agent restarted warns the prompt may have arrived", async () => {
+    const m = stubbed();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mi = m as any;
+    const emitted = vi.spyOn(mi, "emit");
+    mi.bridge.request = (method: string) => {
+      if (method !== METHODS.sessionPrompt) return Promise.resolve({});
+      mi.generation++; // onExit bumps the generation before the request rejects
+      return Promise.reject(new Error("devin acp exited"));
+    };
+    const s = { sessionId: "s23", cwd: "/tmp/x", running: true, loaded: true, attachedGen: mi.generation, queue: [
+      { id: "q-c", blocks: [{ type: "text", text: "steer" }] },
+    ] as { id: string; blocks: unknown[] }[] };
+    mi.sessions.set("s23", s);
+    expect(m.sendQueuedNow("s23", "q-c")).toEqual({ sent: true });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(s.queue.map((q) => q.id)).toEqual(["q-c"]);
+    const notice = emitted.mock.calls.find(([, type]) => type === "notice");
+    expect((notice?.[2] as { text: string }).text).toMatch(/may already have been received/);
+    emitted.mockRestore();
+  });
+
   it("sendQueuedNow on an idle session just drains the entry", async () => {
     const m = stubbed();
     const prompts: string[] = [];
@@ -946,7 +968,7 @@ describe("provisional region (two-region transcript)", () => {
     expect(m.provisional("s1").map((i) => i.text)).toEqual(["hi", "partial"]);
     mi.emit("s1", "turn_end", {});
     expect(m.provisional("s1").every((i) => i.done)).toBe(true);
-    m.__testDurableThrough("s1", 999); // db watcher advanced past the turn
+    m.__testDurableThrough("s1", 999, [{ nodeId: 999, role: "agent" }]); // db watcher advanced past the turn
     expect(m.provisional("s1")).toEqual([]);
   });
 
@@ -961,9 +983,9 @@ describe("provisional region (two-region transcript)", () => {
     mi.emit("s1", "session_update", { sessionUpdate: "plan", entries: [{ content: "step", status: "pending" }] });
     mi.emit("s1", "session_update", { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "answer" } });
     mi.emit("s1", "turn_end", {});
-    // durable covers the turn — no sessions.db rows exist in the test env,
-    // so the spine read yields [] and retained items anchor at turn start
-    m.__testDurableThrough("s1", 160);
+    // durable covers the turn with only the agent row: the user echo stays
+    // unaligned, so retained items anchor at turn start
+    m.__testDurableThrough("s1", 160, [{ nodeId: 160, role: "agent" }]);
     expect(m.provisional("s1")).toEqual([]);
     const ret = m.retained("s1");
     expect(ret.map((i) => i.role ?? i.kind)).toEqual(["thought", "plan"]);
@@ -1011,7 +1033,7 @@ describe("provisional region (two-region transcript)", () => {
     await m.prompt("s1", [{ type: "text", text: "go" }]);
     mi.emit("s1", "session_update", { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "answer" } });
     mi.emit("s1", "turn_end", {});
-    m.__testDurableThrough("s1", 160);
+    m.__testDurableThrough("s1", 160, [{ nodeId: 160, role: "agent" }]);
     expect(m.provisional("s1")).toEqual([]);
     expect(m.retained("s1")).toEqual([]);
   });
@@ -1797,6 +1819,51 @@ it("retains a failed SQLite turn while holding the next queued prompt, then reco
     db.exec("DROP TRIGGER IF EXISTS reject_queued_turn"); db.close();
     mi.dbSub?.(); itemLog.itemLogForget(sessionId);
   }
+});
+
+it("holds a queued prompt quietly while the previous answer's durable row lags", async () => {
+  const m = stubbed();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mi = m as any;
+  const sessionId = "lagging-answer";
+  mi.sessions.set(sessionId, { sessionId, cwd: "/tmp", loaded: true, running: false, attachedGen: mi.generation, queue: [] });
+  m.__testDurableThrough(sessionId, 100);
+  const sent: string[] = [], completions: (() => void)[] = [];
+  mi.bridge.request = (_method: string, params: { prompt: { text: string }[] }) => {
+    sent.push(params.prompt[0].text);
+    return new Promise((resolve) => { completions.push(() => resolve({})); });
+  };
+  const emitted = vi.spyOn(mi, "emit");
+  await m.prompt(sessionId, [{ type: "text", text: "first" }]);
+  await m.prompt(sessionId, [{ type: "text", text: "second" }]);
+  mi.emit(sessionId, "session_update", { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "lagging answer" } });
+  m.__testDurableThrough(sessionId, 101, [{ nodeId: 101, role: "user" }]); // only the user row is durable
+  completions[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(sent).toEqual(["first"]);
+  expect(m.provisional(sessionId).map((i) => i.text)).toContain("lagging answer");
+  expect(emitted.mock.calls.some(([, type]) => type === "notice")).toBe(false);
+  m.__testDurableThrough(sessionId, 102, [{ nodeId: 102, role: "agent" }]); // the answer commits
+  mi.sessions.get(sessionId).turnRetryAfter = 0;
+  await mi.reattachStale();
+  expect(sent).toEqual(["first", "second"]);
+  completions[1]();
+  await new Promise((resolve) => setImmediate(resolve));
+  emitted.mockRestore();
+});
+
+it("an adopted session without a daemon-recorded cwd exposes no fs base to the bridge", async () => {
+  const m = stubbed();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mi = m as any;
+  mi.bridge.proc = { pid: -1 }; // daemon socket mode
+  mi.bridge.request = async (method: string) =>
+    method === "_devin-web/shim_state"
+      ? { gen: 1, sessions: [{ sessionId: "nocwd", cwd: null, loadResult: null, busy: true }] }
+      : {};
+  await mi.reattachStale();
+  expect(m.getSession("nocwd")?.adopted).toBe(true);
+  expect(mi.bridge.handlers.sessionCwd("nocwd")).toBeUndefined();
 });
 
 it("restores and gates an ended SQLite turn when prompt is the first call after restart", async () => {

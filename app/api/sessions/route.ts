@@ -9,7 +9,7 @@ import { archivedMap } from "@/lib/archive";
 import { bindWorktreeSession, createWorktree, removeWorktree, worktreeForCwd } from "@/lib/worktrees";
 import { uiState } from "@/lib/uiState";
 import { applySessionDefaults } from "@/lib/sessionDefaults";
-import { configuredRoots, pathInRoots } from "@/lib/fsRoots";
+import { cwdRootsError } from "@/lib/fsRoots";
 import { itemLogModelMap } from "@/lib/itemLog";
 
 export const dynamic = "force-dynamic";
@@ -113,10 +113,8 @@ export async function POST(req: NextRequest) {
     // validate while it's still caller input, or one POST could open the
     // whole tree when DEVIN_WEB_FS_ROOTS is configured. Check before stat
     // so rejected paths cannot disclose whether a directory exists.
-    const roots = configuredRoots();
-    if (roots.length > 0 && !pathInRoots(dir, roots)) {
-      return NextResponse.json({ error: `cwd outside DEVIN_WEB_FS_ROOTS: ${dir}` }, { status: 403 });
-    }
+    const denied = cwdRootsError(dir);
+    if (denied) return NextResponse.json({ error: denied }, { status: 403 });
     try {
       if (!statSync(dir).isDirectory()) {
         return NextResponse.json({ error: `not a directory: ${dir}` }, { status: 400 });

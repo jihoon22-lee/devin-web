@@ -60,6 +60,9 @@ interface ActiveSession {
   /** taken over mid-turn from the daemon — no session/load replay will ever
    *  arrive, so resyncing clients are seeded from the durable transcript */
   adopted?: boolean;
+  /** adopted from the daemon without a recorded cwd — `cwd` is only the
+   *  web's default; agent fs must not resolve relative paths against it */
+  cwdUnknown?: boolean;
   /** a runPrompt in THIS process owns the current turn. The daemon appends a
    *  synthesized turn_end to every prompt response (same tick) — while this is
    *  set that notification is ignored so the queue shifts exactly once (in
@@ -275,6 +278,8 @@ export class SessionManager {
   private dbSub: (() => void) | null = null;
   /** test seam — pretend the durable db advanced to a node_id */
   private testDurable = new Map<string, number>();
+  /** test seam — durable spine rows the fake db holds (sessions.db is empty in tests) */
+  private testSpine = new Map<string, DurableSpineRow[]>();
 
   /** Memoized per sessions.db commit. `durableThrough` sits on request and
    *  push paths (every transcript delta, every provisional flush, the /items
@@ -314,8 +319,9 @@ export class SessionManager {
 
   /** test-only: pretend the durable db advanced, then run the drop check the
    *  real sessions.db watcher would trigger. Production never calls this. */
-  __testDurableThrough(sessionId: string, n: number) {
+  __testDurableThrough(sessionId: string, n: number, spine: DurableSpineRow[] = []) {
     this.testDurable.set(sessionId, n);
+    if (spine.length) this.testSpine.set(sessionId, [...(this.testSpine.get(sessionId) ?? []), ...spine]);
     this.regions.onDurableChange();
   }
 
@@ -332,6 +338,8 @@ export class SessionManager {
     after: number,
     through: number,
   ): DurableSpineRow[] {
+    const fake = this.testSpine.get(sessionId);
+    if (fake) return fake.filter((r) => r.nodeId > after && r.nodeId <= through);
     try {
       const db = openSessionsDb();
       try {
@@ -369,7 +377,10 @@ export class SessionManager {
       // not this process's cwd — the web server runs from the devin-web repo,
       // so resolving there lands another project's artifacts in this tree
       // (the b9-*.png pollution).
-      sessionCwd: (sid) => this.sessions.get(sid)?.cwd,
+      sessionCwd: (sid) => {
+        const s = this.sessions.get(sid);
+        return s && !s.cwdUnknown ? s.cwd : undefined;
+      },
       onExit: (code, signal) => {
         this.broadcastGlobal({ type: "agent_exit", data: { code, signal } });
         this.generation++;
@@ -442,6 +453,7 @@ export class SessionManager {
       this.sessions.set(d.sessionId, {
         sessionId: d.sessionId,
         cwd: d.cwd ?? this.defaultCwd,
+        cwdUnknown: d.cwd == null,
         running: true,
         loaded: true,
         attachedGen: this.generation,
@@ -1026,7 +1038,10 @@ export class SessionManager {
         s.turnRetryStartedAt ??= Date.now();
         s.turnRetryDelay = Math.min((s.turnRetryDelay ?? 500) * 2, 30_000);
         s.turnRetryAfter = Date.now() + s.turnRetryDelay;
-        if (firstFailure) this.emit(s.sessionId, "notice", { text: startError
+        // a bounded wait for the previous answer's durable row is routine —
+        // only real storage/start problems deserve the notice
+        const quiet = !startError && this.regions.awaitingCommit(s.sessionId);
+        if (firstFailure && !quiet) this.emit(s.sessionId, "notice", { text: startError
           ? `Could not start the turn: ${startError}. Your prompt is kept in the queue; retrying automatically.`
           : "The previous transcript is not ready. Your prompt is kept in the queue; retrying automatically." });
         if (!s.turnRetryWarned && Date.now() - s.turnRetryStartedAt >= 30_000) {
@@ -1239,8 +1254,13 @@ export class SessionManager {
               queued: s.queue.length,
               queue: queueView(s),
             });
+            // an agent exit rejects in-flight requests even when the agent had
+            // already accepted the steer — say so instead of "never reached"
+            const restarted = generation !== this.generation;
             this.emit(sessionId, "notice", {
-              text: "Send-now failed — the prompt was returned to the queue",
+              text: restarted
+                ? "The agent restarted during send-now — the prompt was returned to the queue but may already have been received; check the conversation before it runs again"
+                : "Send-now failed — the prompt was returned to the queue",
             });
           }
         })

@@ -3,8 +3,10 @@ import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { openDb } from "../lib/sqlite";
 import * as itemLog from "../lib/itemLog";
-import { TurnRegions, type TurnRegionDeps } from "../lib/acp/turnRegions";
+import { FINALIZE_GRACE_MS, TurnRegions, type TurnRegionDeps } from "../lib/acp/turnRegions";
 import type { AssembledItem } from "../lib/acp/itemAssembler";
+import type { DurableSpineRow } from "../lib/acp/alignSpine";
+import { integrityCount } from "../lib/integrityBeacon";
 
 const fixtureStateDir = process.env.DEVIN_WEB_STATE_DIR!;
 afterAll(() => {
@@ -274,5 +276,109 @@ describe("TurnRegions with injected storage and durable state", () => {
     r.onDurableChange();
     expect(r.provisional("s")).toEqual([]);
     expect(r.durableThrough("s")).toBe(110);
+  });
+});
+
+/** A turn whose mid-turn rows (user + tool) are durable while the final
+ *  agent answer's row lags the ACP prompt response. */
+function laggingTurn(restored: ReturnType<TurnRegionDeps["storage"]["restore"]> = null) {
+  let tip = 100;
+  let seq = 0;
+  const rows: DurableSpineRow[] = [{ nodeId: 101, role: "user" }, { nodeId: 102, role: "tool", toolCallId: "t1" }];
+  const deps: TurnRegionDeps = {
+    maxNode: () => tip,
+    spineRows: (_sid, after, through) => rows.filter((r) => r.nodeId > after && r.nodeId <= through),
+    running: () => true,
+    publish: vi.fn(),
+    pokeDurable: vi.fn(),
+    watchDurable: vi.fn(),
+    invalidateDurable: vi.fn(),
+    floorSeq: (f) => { seq = Math.max(seq, f); },
+    nextSeq: () => ++seq,
+    finalToolUpdates: vi.fn(() => []),
+    storage: {
+      restore: () => restored, loadRetained: () => [], save: vi.fn(), clearExcept: vi.fn(),
+      drop: vi.fn(), finalize: vi.fn(), pruneRetained: vi.fn(), forget: vi.fn(),
+    },
+  };
+  const r = new TurnRegions(deps, "lag");
+  const feed = (type: string, data: unknown) => r.feed({ seq: ++seq, sessionId: "s", type, data });
+  const play = () => {
+    r.beginTurn("s");
+    feed("session_update", { sessionUpdate: "user_message", content: [{ type: "text", text: "q" }] });
+    feed("session_update", { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "thinking" } });
+    feed("session_update", { sessionUpdate: "tool_call", toolCallId: "t1", title: "ls", status: "pending" });
+    feed("session_update", { sessionUpdate: "tool_call_update", toolCallId: "t1", status: "completed" });
+    feed("session_update", { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "FINAL ANSWER" } });
+  };
+  return { r, deps, feed, play, rows, setTip: (n: number) => { tip = n; } };
+}
+
+describe("M1: final agent row lagging the prompt response", () => {
+  it("keeps the region until the last agent row commits, then finalizes", () => {
+    vi.useFakeTimers();
+    const h = laggingTurn();
+    h.play();
+    h.setTip(102); // mid-turn rows durable, final answer not yet
+    h.feed("turn_end", {});
+    expect(h.r.provisional("s").map((i) => i.text)).toContain("FINAL ANSWER");
+    expect(h.r.durableThrough("s")).toBe(100);
+    expect(h.r.awaitingCommit("s")).toBe(true);
+    expect(h.r.beginTurn("s")).toBeUndefined(); // next prompt waits in the queue
+    h.rows.push({ nodeId: 103, role: "agent" });
+    h.setTip(103);
+    h.r.onDurableChange();
+    expect(h.r.provisional("s")).toEqual([]);
+    expect(h.r.retained("s").map((i) => [i.text, i.anchorNode])).toEqual([["thinking", 101]]);
+    expect(h.r.durableThrough("s")).toBe(103);
+    expect(h.r.awaitingCommit("s")).toBe(false);
+  });
+
+  it("finalizes after the grace window when the row never commits (grace expiry)", () => {
+    vi.useFakeTimers();
+    const before = integrityCount().total;
+    const h = laggingTurn();
+    h.play();
+    h.setTip(102);
+    h.feed("turn_end", {});
+    vi.advanceTimersByTime(FINALIZE_GRACE_MS);
+    expect(h.r.provisional("s")).toEqual([]);
+    expect(integrityCount()).toMatchObject({ total: before + 1, lastSig: "server:finalizeUnaligned" });
+    expect(h.r.beginTurn("s")).toBeDefined();
+  });
+
+  it("a restored, partially covered ended turn finalizes without a grace wait (restored)", () => {
+    vi.useFakeTimers();
+    const before = integrityCount().total;
+    const h = laggingTurn({
+      turnId: "told", startNode: 100, ended: true,
+      items: [{ id: "p-told-1", kind: "text", role: "agent", text: "OLD ANSWER", done: true, seqFrom: 1, seqTo: 1 }],
+    });
+    h.setTip(102);
+    expect(h.r.provisional("s")).toEqual([]);
+    expect(integrityCount().total).toBe(before + 1);
+  });
+
+  it("forget during grace cancels the pending re-check (forget during grace)", () => {
+    vi.useFakeTimers();
+    const h = laggingTurn();
+    h.play();
+    h.setTip(102);
+    h.feed("turn_end", {});
+    h.r.forget("s");
+    const published = (h.deps.publish as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(() => vi.advanceTimersByTime(FINALIZE_GRACE_MS)).not.toThrow();
+    expect((h.deps.publish as ReturnType<typeof vi.fn>).mock.calls.length).toBe(published);
+    expect(h.r.awaitingCommit("s")).toBe(false);
+  });
+
+  it("a user-echo-only ending does not wait for a commit", () => {
+    const h = laggingTurn();
+    h.r.beginTurn("s");
+    h.feed("session_update", { sessionUpdate: "user_message", content: [{ type: "text", text: "q" }] });
+    h.setTip(102);
+    h.feed("turn_end", {});
+    expect(h.r.awaitingCommit("s")).toBe(false);
+    expect(h.r.provisional("s")).toEqual([]);
   });
 });

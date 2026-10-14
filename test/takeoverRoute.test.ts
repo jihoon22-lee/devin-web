@@ -24,6 +24,7 @@ vi.mock("@/lib/state", () => ({
   }),
 }));
 vi.mock("@/lib/locks", () => ({
+  DEVIN_CLI_DIR: "/nonexistent-devin-cli-dir",
   lockOwner: (sessionId: string, ourPid: number | null) => {
     const owner = h.lockOwner(sessionId, ourPid);
     return owner ? { ...owner, ours: owner.pid === ourPid } : owner;

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { manager } from "@/lib/state";
+import { existingSessionCwdError, recordedSessionCwd } from "@/lib/sessionCwd";
 
 export const dynamic = "force-dynamic";
 
@@ -13,6 +14,8 @@ export async function POST(req: NextRequest, ctx: Ctx) {
     const { id } = await ctx.params;
     const { cwd, nodeId } = (await req.json()) as { cwd?: string; nodeId?: number };
     const dir = cwd || manager().defaultCwd;
+    const denied = await existingSessionCwdError(dir, () => recordedSessionCwd(id, manager()));
+    if (denied) return NextResponse.json({ error: denied }, { status: 403 });
     const res =
       nodeId != null && Number.isFinite(nodeId) && nodeId > 0
         ? await manager().forkAtNode(id, dir, nodeId)

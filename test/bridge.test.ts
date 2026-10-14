@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { AcpBridge } from "../lib/acp/bridge";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setFsRootsForTest, setSessionRootsProvider } from "../lib/fsRoots";
 
 const MISSING = "definitely-not-a-devin-binary";
 
@@ -242,5 +246,76 @@ describe("local RPC reply ownership", () => {
     resolve({ content: "new bytes" });
     await new Promise((r) => setImmediate(r));
     expect(JSON.parse(Buffer.concat(newReplies).toString())).toMatchObject({ id: 1, result: { content: "new bytes" } });
+  });
+});
+
+describe("AcpBridge agent fs gate (L3/L4)", () => {
+  const base = mkdtempSync(join(tmpdir(), "dw-bridge-fs-"));
+  const allowed = mkdtempSync(join(base, "allowed-"));
+  const ownCwd = mkdtempSync(join(base, "own-"));
+  const otherSession = mkdtempSync(join(base, "other-"));
+  const bridge = () => new AcpBridge({
+    onSessionUpdate() {}, onNotification() {}, onClientRequest() {}, onExit() {},
+    sessionCwd: (sid) => (sid === "own" ? ownCwd : undefined),
+  });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const serve = (b: AcpBridge, method: string, p: object) => (b as any).serveLocally(method, p) as Promise<unknown>;
+
+  it("writes relative paths into the requesting session's cwd", async () => {
+    setFsRootsForTest([allowed]);
+    try {
+      await serve(bridge(), "fs/write_text_file", { sessionId: "own", path: "out.txt", content: "x" });
+      expect(existsSync(join(ownCwd, "out.txt"))).toBe(true);
+    } finally { setFsRootsForTest(null); }
+  });
+
+  it("refuses a relative path for a session whose cwd is unknown", async () => {
+    await expect(serve(bridge(), "fs/write_text_file", { sessionId: "ghost", path: "b9.png", content: "x" }))
+      .rejects.toThrow("relative path without a known session cwd");
+  });
+
+  it("does not let one session's agent write into another session's cwd when roots are set", async () => {
+    setFsRootsForTest([allowed]);
+    setSessionRootsProvider(() => [otherSession]); // browser routes may browse it; the agent may not write it
+    try {
+      await expect(serve(bridge(), "fs/write_text_file", { sessionId: "own", path: join(otherSession, "x.txt"), content: "x" }))
+        .rejects.toThrow("path outside DEVIN_WEB_FS_ROOTS");
+      expect(existsSync(join(otherSession, "x.txt"))).toBe(false);
+    } finally {
+      setFsRootsForTest(null);
+      setSessionRootsProvider(null);
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("AcpBridge initialize clientInfo (I1)", () => {
+  it("advertises the package.json version", async () => {
+    const { PassThrough } = await import("node:stream");
+    const { EventEmitter } = await import("node:events");
+    const { readFileSync } = await import("node:fs");
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const proc = Object.assign(new EventEmitter(), {
+      pid: 4242, exitCode: null, stdin, stdout, stderr: null,
+      kill() {}, removeAllListeners() { return this; },
+    });
+    let clientInfo: unknown;
+    stdin.on("data", (d) => {
+      for (const line of String(d).split("\n").filter(Boolean)) {
+        const msg = JSON.parse(line);
+        if (msg.method === "initialize") {
+          clientInfo = msg.params.clientInfo;
+          stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } }) + "\n");
+        }
+      }
+    });
+    const b = new AcpBridge(
+      { onSessionUpdate() {}, onNotification() {}, onClientRequest() {}, onExit() {} },
+      [], "unused", 1000, async () => proc as never,
+    );
+    await b.ensure();
+    expect(clientInfo).toEqual({ name: "devin-web", version: pkg.version });
   });
 });

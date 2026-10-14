@@ -31,9 +31,35 @@ describe("lib/promptQueue", () => {
     pq.writeSessionQueue("s-d", []);
   });
 
-  it("recovers empty on a corrupt file", () => {
-    writeFileSync(join(stateDir, "prompt-queue.json"), "{not json");
+  const quarantined = () => readdirSync(stateDir).filter((n) => n.startsWith("prompt-queue.json.corrupt-"));
+  const clearQuarantine = () => { for (const n of quarantined()) rmSync(join(stateDir, n)); };
+  const corrupt = (text: string) => {
+    const f = join(stateDir, "prompt-queue.json");
+    writeFileSync(f, text);
+    utimesSync(f, new Date(), new Date(Date.now() + 5_000));
+  };
+
+  it("recovers empty on a corrupt file and sets the file aside", () => {
+    corrupt("{not json");
     expect(pq.readAllQueues()).toEqual({});
+    expect(quarantined()).toHaveLength(1);
+    expect(readFileSync(join(stateDir, quarantined()[0]), "utf8")).toBe("{not json");
+    clearQuarantine();
+  });
+
+  it("keeps other sessions' attachment blobs while a corrupt queue file is set aside", () => {
+    const big = "A".repeat(600 * 1024); // above BLOB_OFFLOAD_CHARS → stored out-of-line
+    pq.writeSessionQueue("s-keep", [{ id: "q-k", blocks: [{ type: "image", data: big, mimeType: "image/png" }] }]);
+    const blob = readdirSync(join(stateDir, "queue-blobs")).find((n) => n.startsWith("s-keep--"))!;
+    expect(blob).toBeTruthy();
+    corrupt("{truncated");
+    pq.writeSessionQueue("s-new", [{ id: "q-n", blocks: blk("after corruption") }]);
+    expect(quarantined()).toHaveLength(1);
+    expect(existsSync(join(stateDir, "queue-blobs", blob))).toBe(true);
+    expect(pq.readAllQueues()["s-new"]?.[0]?.blocks).toEqual(blk("after corruption"));
+    clearQuarantine();
+    pq.writeSessionQueue("s-new", []);
+    expect(existsSync(join(stateDir, "queue-blobs", blob))).toBe(false); // resolved → normal sweep resumes
   });
 
   it("drops malformed entries but keeps valid ones", () => {
